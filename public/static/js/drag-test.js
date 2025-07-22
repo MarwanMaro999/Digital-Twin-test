@@ -3386,42 +3386,47 @@ function undo() {
         });
 
     } else if (action.type === 'transform') {
-        const model = scene.getObjectByProperty('uuid', action.modelId);
-        if (model) {
-            // Revert to the old state (before the transformation)
-            model.position.copy(action.oldPosition);
-            model.scale.copy(action.oldScale);
-            model.rotation.copy(action.oldRotation);
+    const model = scene.getObjectByProperty('uuid', action.modelId);
+    if (model) {
+        // Revert to the old state (before the transformation)
+        model.position.copy(action.oldPosition);
+        model.rotation.copy(action.oldRotation);
+        model.scale.copy(action.oldScale);
+        
+        // Update the model instance scale property to match the UI slider
+        const modelInstance = modelInstances.find(inst => inst.model.uuid === action.modelId);
+        if (modelInstance && action.oldScale) {
+            const allModels = { ...models, ...importedModels };
+            const baseName = modelInstance.name.replace(/ \d+$/, '');
+            const modelConfig = allModels[baseName] || allModels[modelInstance.name];
             
-            // Update the modelInstance.scale property to match the reverted scale
-            const modelInstance = modelInstances.find(inst => inst.model.uuid === action.modelId);
-            if (modelInstance) {
-                // Calculate the scale multiplier from the actual model scale
-                const baseName = modelInstance.name.replace(/ \d+$/, '');
-                const allModels = { ...models, ...importedModels };
-                const modelConfig = allModels[baseName] || allModels[modelInstance.name];
-                
-                if (modelConfig && modelConfig.isImported) {
-                    // For imported models, calculate the multiplier
-                    const baseScale = modelConfig.scale || 1;
-                    modelInstance.scale = action.oldScale.x / baseScale;
-                } else {
-                    // For regular models, the scale is the multiplier
-                    modelInstance.scale = action.oldScale.x;
-                }
+            if (modelConfig && modelConfig.isImported) {
+                // For imported models: actualScale = baseScale * scaleMultiplier
+                const baseScale = modelConfig.scale || 1;
+                const scaleMultiplier = action.oldScale.x / baseScale;
+                modelInstance.scale = scaleMultiplier;
+            } else if (modelConfig && modelConfig.realDimensions && modelConfig.glbDimensions) {
+                // For regular models with real dimensions: actualScale = (realDim/glbDim) * scaleMultiplier
+                const baseScaleX = modelConfig.realDimensions.width / modelConfig.glbDimensions.width;
+                const scaleMultiplier = action.oldScale.x / baseScaleX;
+                modelInstance.scale = scaleMultiplier;
+            } else {
+                // Fallback for models without configuration
+                modelInstance.scale = action.oldScale.x;
             }
             
-            // --- FIX STARTS HERE ---
-            if (selectedModel && selectedModel.model.uuid === action.modelId) {
-                updateSelectedModelControls(selectedModel); // Refresh UI for selected model
+            // Update the UI to reflect the scale change if this model is selected
+            if (selectedModel === modelInstance) {
+                updateSelectedModelControls(selectedModel);
             }
-            // --- FIX ENDS HERE ---
-            showNotification(`Undid: Transform on "${model.name || model.uuid}"`, "success");
-        } else {
-            console.warn("Model not found for 'transform' undo:", action.modelId);
-            showNotification("Error undoing 'transform' action.", "error");
         }
+        
+        showNotification(`Undid: Transform on "${model.name || model.uuid}"`, "success");
+    } else {
+        console.warn("Model not found for 'transform' undo:", action.modelId);
+        showNotification("Error undoing 'transform' action.", "error");
     }
+}
     updateSceneStats();
     scheduleRender();
     render();
