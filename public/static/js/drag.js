@@ -2543,54 +2543,85 @@ function setupSelectedModelEventListeners(modelInstance) {
     }
   });
   
-  // Scale slider control
+  // --- START: UNDO/REDO FIX FOR SCALE SLIDER ---
   const scaleSlider = document.getElementById('scaleSlider');
-  const scaleDisplay = document.querySelector('.scale-display');
   const rangeValue = document.querySelector('.range-value');
   
   if (scaleSlider) {
+    let initialSliderState = null;
+
+    // 1. Capture the initial state when the user starts interacting with the slider
+    scaleSlider.addEventListener('mousedown', () => {
+        initialSliderState = {
+            position: model.position.clone(),
+            scale: model.scale.clone(),
+            rotation: model.rotation.clone()
+        };
+    });
+
+    // 2. Handle the live scaling as the user drags the slider
     scaleSlider.addEventListener('input', (e) => {
-      const scaleMultiplier = parseFloat(e.target.value);
-      
-      // Apply safe scaling with validation (max 2x for all models)
-      const validScale = getValidScale(scaleMultiplier, 0.1, 2);
-      
-      let actualScale;
-      if (modelConfig.isImported) {
-        // For imported models, multiply the base calculated scale by the slider value
-        const baseScale = modelConfig.scale || 1;
-        actualScale = baseScale * validScale;
-        model.scale.set(actualScale, actualScale, actualScale);
-        positionModelOnSurface(model);
-      } else {
-        // For existing models, use the scaling function
-        actualScale = applySafeScale(model, validScale, modelConfig);
-      }
-      
-      // Store the current scale multiplier in the model instance
-      modelInstance.scale = validScale; // Store scale multiplier in the instance
-      
-      // Update UI to reflect the scale multiplier
-      if (scaleDisplay) {
-        scaleDisplay.textContent = validScale.toFixed(1) + 'x';
-      }
-      if (rangeValue) {
-        rangeValue.textContent = validScale.toFixed(1) + 'x';
-      }
-      
-      // Update the slider value to match the actual applied scale
-      e.target.value = validScale.toFixed(1);
-      
-      // Update position inputs if they exist
-      const posYInput = document.getElementById('posY');
-      if (posYInput) {
-        posYInput.value = model.position.y.toFixed(2);
-      }
-      
-      markSceneAsChanged(); // Mark scene as changed on slider input
-      scheduleRender();
+        const scaleMultiplier = parseFloat(e.target.value);
+        const validScale = getValidScale(scaleMultiplier, 0.1, 2);
+        
+        if (modelConfig.isImported) {
+            const baseScale = modelConfig.scale || 1;
+            const actualScale = baseScale * validScale;
+            model.scale.set(actualScale, actualScale, actualScale);
+            positionModelOnSurface(model);
+        } else {
+            applySafeScale(model, validScale, modelConfig);
+        }
+        
+        modelInstance.scale = validScale;
+        
+        if (rangeValue) {
+            rangeValue.textContent = validScale.toFixed(1) + 'x';
+        }
+        
+        const posYInput = document.getElementById('posY');
+        if (posYInput) {
+            posYInput.value = model.position.y.toFixed(2);
+        }
+        
+        markSceneAsChanged();
+        scheduleRender();
+    });
+
+    // 3. When the user releases the slider, record the final state for undo/redo
+    scaleSlider.addEventListener('change', () => {
+        if (!initialSliderState) return; // Exit if we didn't capture an initial state
+
+        const finalState = {
+            position: model.position.clone(),
+            scale: model.scale.clone(),
+            rotation: model.rotation.clone()
+        };
+
+        // Only push to the undo stack if the scale has actually changed
+        if (!initialSliderState.scale.equals(finalState.scale)) {
+            undoStack.push({
+                type: 'transform',
+                modelId: model.uuid,
+                oldPosition: initialSliderState.position,
+                oldScale: initialSliderState.scale,
+                oldRotation: initialSliderState.rotation,
+                newPosition: finalState.position,
+                newScale: finalState.scale,
+                newRotation: finalState.rotation
+            });
+
+            if (undoStack.length > MAX_HISTORY_STATES) {
+                undoStack.shift(); // Keep the stack size manageable
+            }
+            redoStack.length = 0; // A new action clears the redo stack
+            console.log("Scale action recorded. Stack size:", undoStack.length);
+        }
+
+        initialSliderState = null; // Reset for the next interaction
     });
   }
+  // --- END: UNDO/REDO FIX FOR SCALE SLIDER ---
   
   // Initialize transform mode buttons - use the last used mode
   setTimeout(() => {
@@ -3161,9 +3192,16 @@ function undo() {
             // Remove from controls list
             controlsList.splice(controlsList.indexOf(modelInstance.control), 1);
             
+            // --- FIX STARTS HERE ---
             if (selectedModel === modelInstance) {
-                deselectAllModels(); // Deselect if the undone model was selected
+                deselectAllModels(); // Deselect if the undone model was selected, this also updates the UI.
+            } else {
+                // If another model (or no model) was selected, we still need to refresh the sidebar
+                // to show the updated list of models in the scene.
+                updateSelectedModelControls(selectedModel);
             }
+            // --- FIX ENDS HERE ---
+
             showNotification(`Undid: Added "${modelInstance.name}"`, "success");
         } else {
             console.warn("Model not found for 'add' undo:", action.modelId);
@@ -3389,9 +3427,16 @@ function redo() {
             scene.remove(modelInstance.control);
             modelInstances.splice(modelInstances.indexOf(modelInstance), 1);
             controlsList.splice(controlsList.indexOf(modelInstance.control), 1);
+            
+            // --- FIX STARTS HERE ---
             if (selectedModel === modelInstance) {
                 deselectAllModels();
+            } else {
+                // Refresh the sidebar to reflect the removal of the model from the list.
+                updateSelectedModelControls(selectedModel);
             }
+            // --- FIX ENDS HERE ---
+
             showNotification(`Redid: Deleted "${modelInstance.name}"`, "success");
         } else {
             console.warn("Model not found for 'delete' redo:", action.modelId);
