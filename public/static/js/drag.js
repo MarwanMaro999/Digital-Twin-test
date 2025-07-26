@@ -1,13 +1,22 @@
+// ============================================================================
+// IMPORTS AND DEPENDENCIES
+// ============================================================================
 import * as THREE from 'three';
 import { OrbitControls } from 'jsm/controls/OrbitControls.js';
 import { TransformControls } from 'jsm/controls/TransformControls.js';
 import { GLTFLoader } from 'jsm/loaders/GLTFLoader.js';
 
+// ============================================================================
+// GLOBAL VARIABLES AND STATE
+// ============================================================================
+
+// Camera and scene variables
 let cameraPersp, cameraOrtho, currentCamera;
-let isPerformingHistory = false;
 let scene, renderer, orbit;
-let mapSurface, gridHelper;
+let mapSurface;
 let hemiLight, dirLight;
+
+// Model and interaction state
 const controlsList = [];
 let selectedModel = null;
 let selectedControl = null;
@@ -15,14 +24,15 @@ window.modelInstances = [];
 const raycaster = new THREE.Raycaster();
 const mouse = new THREE.Vector2();
 
+// History and undo/redo state
+let isPerformingHistory = false;
+
 // Store the last used transform mode
 let lastTransformMode = 'transform';
 
 // Track unsaved changes and save status
 let hasUnsavedChanges = false;
 window.hasUnsavedChanges = () => hasUnsavedChanges;
-let lastSavedSceneState = null;
-let hasShownChangeNotification = false; // Track if we've already shown the change notification
 let autoSaveInProgress = false; // Track if auto-save is currently in progress
 let pendingChanges = false; // Track if changes occurred during auto-save
 let lastAutoSaveTime = Date.now(); // Track when the last auto-save occurred
@@ -38,8 +48,7 @@ const undoStack = window.undoStack;
 const redoStack = window.redoStack;
 const MAX_HISTORY_STATES = window.MAX_HISTORY_STATES;
 
-// Variable to store the state of the object *before* a transformation
-let initialTransformState = null;
+
 
 // Global storage for imported models
 let importedModels = {};
@@ -71,7 +80,19 @@ const models = {
   }
 };
 
-// Function to scale model using real-world dimensions and align to ground
+// ============================================================================
+// MODEL SCALING AND POSITIONING FUNCTIONS
+// ============================================================================
+
+/**
+ * Scale model using real-world dimensions and align to ground
+ * @param {THREE.Object3D} model - The 3D model to scale
+ * @param {Object} realDimensions - Real world dimensions {width, height, length}
+ * @param {Object} glbDimensions - GLB file dimensions {width, height, length}
+ * @param {number} scaleMultiplier - Additional scale multiplier
+ * @param {number} groundY - Ground level Y coordinate
+ * @returns {number} Final Y position of the model
+ */
 function scaleAndAlignModel(model, realDimensions, glbDimensions, scaleMultiplier = 1, groundY = 0) {
   if (!model || !realDimensions || !glbDimensions) return;
 
@@ -169,7 +190,13 @@ function applySafeScale(model, requestedScale, modelConfig) {
   return validScale;
 }
 
-// Functions to track scene changes
+// ============================================================================
+// SCENE STATE MANAGEMENT FUNCTIONS
+// ============================================================================
+
+/**
+ * Mark the scene as having unsaved changes
+ */
 function markSceneAsChanged() {
   if (!hasUnsavedChanges) {
     hasUnsavedChanges = true;
@@ -183,62 +210,21 @@ function markSceneAsChanged() {
   }
 }
 
-function showBriefChangeNotification() {
-  // Remove any existing brief notifications
-  const existingNotifications = document.querySelectorAll('.brief-change-notification');
-  existingNotifications.forEach(notification => {
-    if (notification.parentNode) {
-      notification.parentNode.removeChild(notification);
-    }
-  });
-  
-  // Create a brief, small notification
-  const notification = document.createElement('div');
-  notification.className = 'brief-change-notification';
-  notification.style.position = 'fixed';
-  notification.style.top = '20px';
-  notification.style.right = '20px';
-  notification.style.background = '#007bff';
-  notification.style.color = 'white';
-  notification.style.padding = '8px 12px';
-  notification.style.borderRadius = '4px';
-  notification.style.fontSize = '12px';
-  notification.style.zIndex = '10001';
-  notification.style.opacity = '0.9';
-  notification.style.transition = 'opacity 0.3s ease';
-  notification.textContent = 'Scene changed';
-  
-  document.body.appendChild(notification);
-  
-  // Auto-remove after 1 second with fade out
-  setTimeout(() => {
-    notification.style.opacity = '0';
-    setTimeout(() => {
-      if (notification.parentNode) {
-        notification.parentNode.removeChild(notification);
-      }
-    }, 300);
-  }, 700);
-}
 
+
+/**
+ * Mark the scene as saved and update UI accordingly
+ */
 function markSceneAsSaved() {
   hasUnsavedChanges = false;
-  hasShownChangeNotification = false; // Reset notification flag when saved
-  lastSavedSceneState = captureSceneState();
-  updateProjectNameDisplay();
+  try {
+    updateProjectNameDisplay();
+  } catch (error) {
+    console.warn('Error updating project name display:', error);
+  }
 }
 
-function captureSceneState() {
-  return {
-    modelCount: modelInstances.length,
-    modelStates: modelInstances.map(instance => ({
-      name: instance.name,
-      position: instance.model.position.toArray(),
-      rotation: instance.model.rotation.toArray(),
-      scale: instance.model.scale.toArray()
-    }))
-  };
-}
+
 
 function updateProjectNameDisplay() {
   const projectNameElement = document.getElementById('projectName');
@@ -330,10 +316,21 @@ function showSaveConfirmationDialog(actionName, onSave, onDontSave, onCancel) {
   };
 }
 
+// ============================================================================
+// RENDERING AND ANIMATION CONTROL
+// ============================================================================
+
 let needsRender = true;
 let animationId;
 
-// Mouse interaction functions for model selection
+// ============================================================================
+// MOUSE INTERACTION AND MODEL SELECTION
+// ============================================================================
+
+/**
+ * Handle mouse click events for model selection
+ * @param {MouseEvent} event - The mouse click event
+ */
 function onMouseClick(event) {
   // Calculate mouse position in normalized device coordinates
   const rect = renderer.domElement.getBoundingClientRect();
@@ -396,6 +393,13 @@ function onMouseMove(event) {
 }
 
 // Model selection functions
+/**
+ * Select a model instance and show its transform controls
+ * @param {Object} modelInstance - The model instance to select
+ * @param {THREE.Object3D} modelInstance.model - The 3D model object
+ * @param {TransformControls} modelInstance.control - The transform controls
+ * @param {string} modelInstance.name - The model name
+ */
 function selectModel(modelInstance) {
   try {
     // Check if modelInstance is valid
@@ -742,7 +746,7 @@ function showNotification(message, type = 'info') {
   notification.style.zIndex = '10000';
   notification.style.fontSize = '14px';
   notification.style.maxWidth = '300px';
-  notification.style.wordWrap = 'break-word';
+  notification.style.overflowWrap = 'break-word';
   notification.textContent = message;
   
   document.body.appendChild(notification);
@@ -1283,272 +1287,15 @@ function init() {
     scheduleRender();
   });
 
-  // Mouse interaction functions for model selection
-  function onMouseClick(event) {
-    // Calculate mouse position in normalized device coordinates
-    const rect = renderer.domElement.getBoundingClientRect();
-    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  // Mouse interaction event listeners will use the global functions defined above
 
-    // Update the picking ray with the camera and mouse position
-    raycaster.setFromCamera(mouse, currentCamera);
+  // Model selection functions will use the global functions defined above
 
-    // Calculate objects intersecting the picking ray
-    const models = modelInstances.map(instance => instance.model);
-    const intersects = raycaster.intersectObjects(models, true);
+  // Scene management functions will use the global functions defined above
 
-    if (intersects.length > 0) {
-      // Find which model instance was clicked
-      const clickedObject = intersects[0].object;
-      let clickedModelInstance = null;
-      
-      // Traverse up the object hierarchy to find the root model
-      let currentObject = clickedObject;
-      while (currentObject && !clickedModelInstance) {
-        clickedModelInstance = modelInstances.find(instance => instance.model === currentObject);
-        currentObject = currentObject.parent;
-      }
-      
-      if (clickedModelInstance) {
-        if (selectedModel === clickedModelInstance) {
-          // Clicked on already selected model, deselect
-          deselectAllModels();
-        } else {
-          // Select the clicked model
-          selectModel(clickedModelInstance);
-        }
-      }
-    } else {
-      // Clicked on empty space, deselect all
-      deselectAllModels();
-    }
-  }
+  // Screenshot and notification functions will use the global functions defined above
 
-  function onMouseMove(event) {
-    // Calculate mouse position in normalized device coordinates
-    const rect = renderer.domElement.getBoundingClientRect();
-    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
-    // Update the picking ray with the camera and mouse position
-    raycaster.setFromCamera(mouse, currentCamera);
-
-    // Calculate objects intersecting the picking ray
-    const models = modelInstances.map(instance => instance.model);
-    const intersects = raycaster.intersectObjects(models, true);
-
-    // Change cursor based on hover
-    if (intersects.length > 0) {
-      renderer.domElement.style.cursor = 'pointer';
-    } else {
-      renderer.domElement.style.cursor = 'default';
-    }
-  }
-
-  // Model selection functions
-  function selectModel(modelInstance) {
-    // Deselect previous model
-    deselectAllModels();
-    
-    // Select new model
-    selectedModel = modelInstance;
-    selectedControl = modelInstance.control;
-    
-    // Show transform controls
-    modelInstance.control.visible = true;
-    modelInstance.control.enabled = true;
-    
-    // Apply the current transform mode to the newly selected model
-    if (lastTransformMode === 'rotate') {
-      modelInstance.control.setMode('rotate');
-      modelInstance.control.showX = false;
-      modelInstance.control.showY = true;
-      modelInstance.control.showZ = false;
-    } else {
-      modelInstance.control.setMode('translate');
-      modelInstance.control.showX = true;
-      modelInstance.control.showY = false;
-      modelInstance.control.showZ = true;
-    }
-    
-    // Update sidebar
-    updateSelectedModelControls(modelInstance);
-      // Automatically switch to "Selected" tab
-    document.querySelectorAll('.sidebar-tab').forEach(tab => tab.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
-
-    const selectedTab = document.querySelector('.sidebar-tab[data-tab="selected"]');
-    if (selectedTab) selectedTab.classList.add('active');
-
-    const selectedTabContent = document.getElementById('selected-tab');
-    if (selectedTabContent) selectedTabContent.classList.add('active');
-
-    scheduleRender();
-  }
-
-  function deselectAllModels() {
-    selectedModel = null;
-    selectedControl = null;
-    
-    // Hide all transform controls
-    controlsList.forEach(control => {
-      control.visible = false;
-      control.enabled = false;
-    });
-    
-    // Update sidebar
-    updateSelectedModelControls(null);
-    
-    scheduleRender();
-  }
-
-  // Scene management functions
-  function updateSceneStats() {
-    const modelCount = modelInstances.length;
-    const modelCountElement = document.getElementById('modelCount');
-    if (modelCountElement) {
-      modelCountElement.textContent = modelCount + ' model' + (modelCount !== 1 ? 's' : '');
-    }
-  }
-
-  function takeScreenshot() {
-    // Temporarily hide all transform controls for clean screenshot
-    const controlsVisibility = controlsList.map(control => control.visible);
-    controlsList.forEach(control => {
-      control.visible = false;
-    });
-    
-    // Render the scene
-    render();
-    
-    // Create download link
-    const link = document.createElement('a');
-    link.download = 'scene_screenshot_' + new Date().toISOString().slice(0, 19).replace(/:/g, '-') + '.png';
-    link.href = renderer.domElement.toDataURL('image/png');
-    link.click();
-    
-    // Restore transform controls visibility
-    controlsList.forEach((control, index) => {
-      control.visible = controlsVisibility[index];
-    });
-    
-    scheduleRender();
-    showNotification('Screenshot saved!', 'success');
-  }
-
-  // Notification system
-  function showNotification(message, type = 'info') {
-    const notification = document.createElement('div');
-    notification.className = `notification ${type}`;
-    notification.style.position = 'fixed';
-    notification.style.top = '20px';
-    notification.style.right = '20px';
-    notification.style.background = type === 'success' ? '#28a745' : type === 'error' ? '#dc3545' : '#007bff';
-    notification.style.color = 'white';
-    notification.style.padding = '12px 20px';
-    notification.style.borderRadius = '6px';
-    notification.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
-    notification.style.zIndex = '10000';
-    notification.style.fontSize = '14px';
-    notification.style.maxWidth = '300px';
-    notification.style.wordWrap = 'break-word';
-    notification.textContent = message;
-    
-    document.body.appendChild(notification);
-    
-    // Auto-remove after 3 seconds
-    setTimeout(() => {
-      if (notification.parentNode) {
-        notification.parentNode.removeChild(notification);
-      }
-    }, 3000);
-  }
-
-  // Import model functionality
-  function showImportModelModal() {
-    // Remove existing modal if any
-    const existingModal = document.getElementById('import-modal');
-    if (existingModal) existingModal.remove();
-
-    const modal = document.createElement('div');
-    modal.id = 'import-modal';
-    modal.style.position = 'fixed';
-    modal.style.top = '0';
-    modal.style.left = '0';
-    modal.style.width = '100vw';
-    modal.style.height = '100vh';
-    modal.style.background = 'rgba(0,0,0,0.35)';
-    modal.style.display = 'flex';
-    modal.style.alignItems = 'center';
-    modal.style.justifyContent = 'center';
-    modal.style.zIndex = '9999';
-    modal.innerHTML = `
-      <div style="background:#fff;padding:32px 28px 24px 28px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.18);min-width:400px;max-width:90vw;">
-        <div style="text-align:center;margin-bottom:20px;">
-          <div style="font-size:32px;color:#339af0;margin-bottom:12px;"><i class='fa-solid fa-file-import'></i></div>
-          <h3 style="margin:0 0 8px 0;font-size:20px;">Import GLB Model</h3>
-          <div style="color:#555;font-size:15px;">Choose a GLB file to import into your library</div>
-        </div>
-        
-        <div style="margin-bottom:16px;">
-          <label style="display:block;margin-bottom:6px;font-weight:500;">Model Name:</label>
-          <input type="text" id="modelName" placeholder="Enter model name" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">
-        </div>
-        
-        <div style="margin-bottom:16px;">
-          <label style="display:block;margin-bottom:6px;font-weight:500;">Real Height (meters):</label>
-          <input type="number" id="realHeight" placeholder="Enter real height in meters" step="0.1" min="0.1" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">
-          <div style="color:#666;font-size:12px;margin-top:4px;">
-            <i class="fa-solid fa-info-circle"></i> This will be used to scale the model proportionally to the map
-          </div>
-        </div>
-        
-        <div style="margin-bottom:20px;">
-          <label style="display:block;margin-bottom:6px;font-weight:500;">GLB File:</label>
-          <input type="file" id="glbFile" accept=".glb" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">
-        </div>
-        
-        <div style="display:flex;justify-content:flex-end;gap:12px;">
-          <button id="import-cancel-btn" style="background:#f1f3f5;color:#222;padding:10px 20px;border:none;border-radius:6px;font-size:14px;cursor:pointer;">Cancel</button>
-          <button id="import-confirm-btn" style="background:#339af0;color:#fff;padding:10px 20px;border:none;border-radius:6px;font-size:14px;cursor:pointer;">Import</button>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(modal);
-
-    document.getElementById('import-cancel-btn').onclick = () => {
-      modal.remove();
-    };
-    
-    document.getElementById('import-confirm-btn').onclick = () => {
-      const modelName = document.getElementById('modelName').value.trim();
-      const realHeight = parseFloat(document.getElementById('realHeight').value);
-      const glbFile = document.getElementById('glbFile').files[0];
-      
-      if (!modelName) {
-        showNotification('Please enter a model name', 'error');
-        return;
-      }
-      
-      if (!realHeight || realHeight <= 0) {
-        showNotification('Please enter a valid real height in meters', 'error');
-        return;
-      }
-      
-      if (!glbFile) {
-        showNotification('Please select a GLB file', 'error');
-        return;
-      }
-      
-      modal.remove();
-      importGLBModel(modelName, glbFile, realHeight);
-    };
-    
-    // Auto-focus on model name input
-    setTimeout(() => {
-      document.getElementById('modelName').focus();
-    }, 100);
-  }
+  // Import model functionality will use the global function defined above
 
   function importGLBModel(modelName, glbFile, realHeight) {
     // Show loading notification
@@ -2036,7 +1783,6 @@ renderer.domElement.addEventListener('drop', (event) => {
 
   const modelName = event.dataTransfer.getData('model-name');
   const modelURL = event.dataTransfer.getData('model-url');
-  const isImported = event.dataTransfer.getData('is-imported') === 'true';
 
   const allModels = { ...models, ...importedModels };
   const modelConfig = allModels[modelName];
@@ -2585,58 +2331,7 @@ renderer.domElement.addEventListener('drop', (event) => {
 
 }
 
-function loadUserLibrary(userId) {
-  const dbRef = ref(getDatabase(), `users/${userId}/libraryModels`);
-  onValue(dbRef, snapshot => {
-    const data = snapshot.val();
-    if (data) {
-      Object.values(data).forEach(entry => {
-        loadModelByURL(entry.url, model => {
-          model.name = entry.name;
-          model.userData.modelName = entry.name;
-          scene.add(model);
-          markSceneAsChanged();
-        });
-      });
-    }
-  });
-}
-async function handleUserModelImport(url, name) {
-  const user = auth.currentUser;
-  if (!user) return;
 
-  const libRef = ref(getDatabase(), `users/${user.uid}/libraryModels`);
-
-  try {
-    const snapshot = await get(libRef);
-    const existing = snapshot.val() || {};
-
-    // Check for duplicate by name or URL
-    const isDuplicate = Object.values(existing).some(model => model.url === url);
-
-
-    if (isDuplicate) {
-      showNotification(`Model "${name}" is already in your library.`, 'info');
-      return;
-    }
-
-    // Add model to Firebase
-    await push(libRef, { name, url });
-
-    // Add to scene
-    loadModelByURL(url, model => {
-      model.name = name;
-      model.userData.modelName = name;
-      scene.add(model);
-      markSceneAsChanged();
-    });
-
-    showNotification(`Model "${name}" added to your library.`, 'success');
-  } catch (error) {
-    console.error('Error checking/importing model:', error);
-    showNotification('Error importing model.', 'error');
-  }
-}
 
 // Update selected model controls in sidebar
 // Full replacement of updateSelectedModelControls with added scale slider + undo
@@ -2652,7 +2347,7 @@ function updateSelectedModelControls(modelInstance) {
     }
 
   if (!modelInstance) {
-    if (modelInstances.length === 0) {
+    if (window.modelInstances.length === 0) {
       selectedControls.style.display = 'none';
       noSelection.style.display = 'block';
       noSelection.innerHTML = `
@@ -2670,7 +2365,7 @@ function updateSelectedModelControls(modelInstance) {
             <i class="fa-solid fa-cube" style="font-size:18px;color:#000000;"></i> Models in Scene
           </h4>
           <div class="model-grid">
-            ${modelInstances.map((instance, idx) => `
+            ${window.modelInstances.map((instance, idx) => `
               <div class="model-item scene-model-list-item" data-model-idx="${idx}" draggable="false" style="cursor:pointer;">
                 <div class="model-icon">
                   <i class="fa-solid fa-cube" style="font-size:18px;color:#fff;"></i>
@@ -3172,7 +2867,7 @@ function duplicateSelectedModel(modelInstance) {
   const modelConfig = allModels[baseName] || allModels[modelInstance.name];
 
   // Count existing models with the same base name
-  const sameNameCount = modelInstances.filter(inst => inst.name === baseName || inst.name.startsWith(baseName + ' ')).length;
+  const sameNameCount = window.modelInstances.filter(inst => inst.name === baseName || inst.name.startsWith(baseName + ' ')).length;
   // Assign unique name
   const uniqueName = sameNameCount === 0 ? baseName : baseName + ' ' + sameNameCount;
 
@@ -3373,9 +3068,9 @@ function deleteSelectedModel(modelInstance) {
     scene.remove(modelInstance.model);
     scene.remove(modelInstance.control);
     // Remove from instances array
-    const index = modelInstances.indexOf(modelInstance);
+    const index = window.modelInstances.indexOf(modelInstance);
     if (index > -1) {
-      modelInstances.splice(index, 1);
+      window.modelInstances.splice(index, 1);
     }
     // Remove from controls list
     const controlIndex = controlsList.indexOf(modelInstance.control);
@@ -3785,41 +3480,7 @@ function undo() {
  * Re-applies the last action undone.
  * Mirror of the undo function but applies actions in reverse.
  */
-// Debug function to print the redo stack
-function debugRedoStack() {
-    console.log("===== REDO STACK DEBUG =====");
-    console.log(`Redo stack length: ${window.redoStack.length}`);
-    
-    window.redoStack.forEach((action, index) => {
-        console.log(`[${index}] Type: ${action.type}, ModelID: ${action.modelId}`);
-        if (action.type === 'transform') {
-            console.log(`    Position: ${action.newPosition ? JSON.stringify(action.newPosition) : 'undefined'}`);
-        }
-    });
-    
-    console.log("===== UNDO STACK DEBUG =====");
-    console.log(`Undo stack length: ${window.undoStack.length}`);
-    
-    window.undoStack.forEach((action, index) => {
-        console.log(`[${index}] Type: ${action.type}, ModelID: ${action.modelId}`);
-    });
-    
-    console.log("=== MODEL INSTANCES ===");
-    modelInstances.forEach((instance, index) => {
-        console.log(`[${index}] Name: ${instance.name}, UUID: ${instance.model.uuid}`);
-    });
-    
-    console.log("=== ID MAPPINGS ===");
-    if (window.modelIdMapping) {
-        Object.keys(window.modelIdMapping).forEach(oldId => {
-            console.log(`${oldId} -> ${window.modelIdMapping[oldId]}`);
-        });
-    } else {
-        console.log("No ID mappings found");
-    }
-    
-    console.log("===========================");
-}
+
 
 function redo() {
   if (redoStack.length === 0) {
@@ -3969,7 +3630,8 @@ window.addEventListener('beforeunload', (e) => {
   // Only show warning dialog if there are unsaved changes
   if (hasUnsavedChanges) {
     e.preventDefault();
-    e.returnValue = '';
+    // Modern browsers use preventDefault() and return value
+    return '';
   }
 });
 
@@ -4037,10 +3699,77 @@ function loadModelFromLibrary(modelName) {
     loader.load(modelConfig.url, (gltf) => {
       // Model loaded successfully, process it
       const model = gltf.scene;
-      
-      // Rest of your model loading code...
-      
-    }, 
+
+      // Set initial position from model config or default
+      if (modelConfig.position) {
+        model.position.copy(modelConfig.position);
+      } else {
+        model.position.set(0, 0, 0);
+      }
+
+      // Apply scaling and positioning
+      let finalScale = 1;
+      if (modelConfig.realDimensions && modelConfig.glbDimensions) {
+        finalScale = applySafeScale(model, modelConfig.scale || 1, modelConfig);
+      } else {
+        model.scale.set(modelConfig.scale || 1, modelConfig.scale || 1, modelConfig.scale || 1);
+        positionModelOnSurface(model, 0);
+      }
+
+      // Configure shadows
+      model.traverse(child => {
+        if (child.isMesh) {
+          child.castShadow = true;
+          child.receiveShadow = true;
+        }
+      });
+
+      // Add to scene
+      scene.add(model);
+
+      // Create transform controls
+      const control = new TransformControls(currentCamera, renderer.domElement);
+      control.attach(model);
+      control.setSize(0.8);
+      control.visible = false;
+      control.enabled = false;
+
+      // Add control event listeners
+      control.addEventListener('dragging-changed', (event) => {
+        if (isPerformingHistory) return;
+        orbit.enabled = !event.value;
+        if (event.value === false && control.object) {
+          markSceneAsChanged();
+        }
+      });
+
+      control.addEventListener('change', () => {
+        markSceneAsChanged();
+        scheduleRender();
+      });
+
+      scene.add(control);
+      controlsList.push(control);
+
+      // Create model instance
+      const modelInstance = {
+        model: model,
+        control: control,
+        name: modelName,
+        scale: finalScale,
+        modelConfig: modelConfig
+      };
+
+      window.modelInstances.push(modelInstance);
+
+      // Update UI
+      updateSceneStats();
+      markSceneAsChanged();
+      scheduleRender();
+
+      showNotification(`${modelName} loaded successfully!`, 'success');
+
+    },
     // Progress callback
     (xhr) => {
       console.log(`${modelName} loading: ${(xhr.loaded / xhr.total * 100).toFixed(0)}%`);
