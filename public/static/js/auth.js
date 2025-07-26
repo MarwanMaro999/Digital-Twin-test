@@ -1,8 +1,8 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-app.js";
-import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged, signOut, sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js";
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js";
 import { getFirestore, collection, addDoc, getDocs, updateDoc, doc, deleteDoc, query, where } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js";
 
-// Firebase configuration
+// Firebase configuration (remains the same)
 const firebaseConfig = {
   apiKey: "AIzaSyADK24bSdgcMCopeF-BJaZucHyIWo_F2kc",
   authDomain: "digital-twin-7de56.firebaseapp.com",
@@ -12,41 +12,29 @@ const firebaseConfig = {
   appId: "1:150254210836:web:a3ef3ec39dc71b7cd4bc01"
 };
 
-// Initialize Firebase
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-// Global variables for user and project management
 let currentUser = null;
 let currentProject = null;
 
-// Authentication state observer
 onAuthStateChanged(auth, (user) => {
+  const logoutBtn = document.getElementById('logoutBtn');
   if (user) {
     currentUser = user;
-    console.log('User signed in:', user.email);
     hideAuthModal();
     showProjectsModal();
-    
-    // Show success notification for sign in
-    showNotification(`Welcome back! Signed in as ${user.email}`, 'success');
-    
-    // Show logout button if it exists
-    const logoutBtn = document.getElementById('logoutBtn');
-    if (logoutBtn) {
-      logoutBtn.style.display = 'inline-flex';
-    }
+    showNotification(`Welcome back, ${user.email}`, 'success');
+    if (logoutBtn) logoutBtn.style.display = 'inline-flex';
   } else {
     currentUser = null;
-    console.log('User signed out');
+    currentProject = null;
     showAuthModal();
-    
-    // Hide logout button if it exists
-    const logoutBtn = document.getElementById('logoutBtn');
-    if (logoutBtn) {
-      logoutBtn.style.display = 'none';
+    if (typeof window.updateProjectDisplay === 'function') {
+        window.updateProjectDisplay(null);
     }
+    if (logoutBtn) logoutBtn.style.display = 'none';
   }
 });
 
@@ -67,10 +55,7 @@ function showAuthModal() {
         <p>Create and manage your digital twin projects</p>
       </div>
       
-      <div class="auth-tabs">
-    <button class="auth-tab active" data-tab="login" style="display:none;">Sign In</button>
-    <button class="auth-tab" data-tab="reset" style="display:none;">Reset Password</button>
-    </div>
+
 
       
       <!-- Login Form -->
@@ -278,21 +263,20 @@ function getAuthErrorMessage(errorCode) {
 
 // Logout function
 async function logoutUser() {
-  try {
+  // Add confirmation for unsaved changes before logging out
+  if (window.hasUnsavedChanges()) {
+    window.showSaveConfirmationDialog(
+      'logging out',
+      () => { // onSave
+        saveProject().then(() => signOut(auth));
+      },
+      () => { // onDontSave
+        signOut(auth);
+      }
+    );
+  } else {
     await signOut(auth);
-    
-    // Clear current project
-    currentProject = null;
-    
-    // Update project display
-    if (typeof window.updateProjectDisplay === 'function') {
-      window.updateProjectDisplay(null);
-    }
-    
     showNotification('Successfully signed out', 'success');
-  } catch (error) {
-    console.error('Logout error:', error);
-    showNotification('Error signing out', 'error');
   }
 }
 
@@ -300,7 +284,6 @@ async function logoutUser() {
 function showProjectsModal() {
   // Check if user is authenticated
   if (!currentUser) {
-    console.log('No user authenticated, showing auth modal instead');
     showAuthModal();
     return;
   }
@@ -467,7 +450,7 @@ function showCreateProjectModal() {
         </div>
       </form>
       
-      <div id="create-project-error" class="error-message"></div>
+      <div id="create-project-error" class="error-message" style="display: none;"></div>
     </div>
   `;
   
@@ -475,19 +458,33 @@ function showCreateProjectModal() {
   
   // Setup form submission
   document.getElementById('create-project-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    
-    const name = document.getElementById('project-name').value.trim();
-    const description = document.getElementById('project-description').value.trim();
-    const errorElement = document.getElementById('create-project-error');
+        e.preventDefault();
+        const name = document.getElementById('project-name').value.trim();
+        const description = document.getElementById('project-description').value.trim();
+        const errorElement = document.getElementById('create-project-error');
     
     if (!name) {
       errorElement.textContent = 'Project name is required';
+      errorElement.style.display = 'block';
       return;
     }
     
     try {
       errorElement.textContent = '';
+      errorElement.style.display = 'none';
+      
+      // Check if project name already exists for this user
+      const projectsQuery = query(collection(db, 'projects'), 
+        where('userId', '==', currentUser.uid),
+        where('name', '==', name));
+      const existingProjects = await getDocs(projectsQuery);
+      
+      if (!existingProjects.empty) {
+        errorElement.textContent = 'A project with this name already exists. Please choose a different name.';
+        errorElement.style.display = 'block';
+        showNotification('Project name already exists', 'error');
+        return;
+      }
       
       const projectData = {
         name: name,
@@ -528,6 +525,7 @@ function showCreateProjectModal() {
     } catch (error) {
       console.error('Error creating project:', error);
       errorElement.textContent = 'Error creating project. Please try again.';
+      errorElement.style.display = 'block';
     }
   });
   
@@ -547,6 +545,22 @@ function hideCreateProjectModal() {
 
 // Open existing project
 async function openProject(projectId) {
+  if (window.hasUnsavedChanges()) {
+    window.showSaveConfirmationDialog(
+      'opening a new project',
+      () => { // onSave
+        saveProject().then(() => proceedToOpen(projectId));
+      },
+      () => { // onDontSave
+        proceedToOpen(projectId);
+      }
+    );
+  } else {
+    proceedToOpen(projectId);
+  }
+}
+
+async function proceedToOpen(projectId) {
   try {
     const projectDoc = await getDocs(query(collection(db, 'projects'), where('userId', '==', currentUser.uid)));
     const project = projectDoc.docs.find(doc => doc.id === projectId);
@@ -555,16 +569,14 @@ async function openProject(projectId) {
       currentProject = { id: project.id, ...project.data() };
       hideProjectsModal();
       
-      // Update project name display
       if (typeof window.updateProjectDisplay === 'function') {
         window.updateProjectDisplay(currentProject.name);
       }
-      
-      // Load project data into the scene
-      if (currentProject.sceneData && currentProject.sceneData.models) {
+
+      if (currentProject.sceneData) {
         loadProjectScene(currentProject.sceneData);
       }
-      
+
       showNotification(`Project "${currentProject.name}" opened!`, 'success');
     }
   } catch (error) {
@@ -572,6 +584,8 @@ async function openProject(projectId) {
     showNotification('Error opening project', 'error');
   }
 }
+
+
 
 // Delete project
 async function deleteProject(projectId, projectName) {
@@ -624,17 +638,57 @@ async function confirmDeleteProject(projectId) {
   }
 }
 
-// Save current scene to project
-async function saveProject() {
+// Save current scene to project - enhanced for auto-save support
+async function saveProject(silentMode = false) {
   if (!currentUser) {
-    showNotification('Please sign in to save your project', 'error');
-    return;
+    if (!silentMode) showNotification('Please sign in to save your project', 'error');
+    return Promise.reject(new Error('Not authenticated'));
+  }
+
+  if (!currentProject) {
+    if (!silentMode) {
+      showSaveAsModal();
+    }
+    return Promise.reject(new Error('No current project'));
+  }
+
+  try {
+    const sceneData = getCurrentSceneData();
+    await updateDoc(doc(db, 'projects', currentProject.id), {
+      sceneData: sceneData,
+      lastModified: new Date().toISOString(),
+      modelCount: sceneData.models.length
+    });
+
+    if (!silentMode) {
+      showNotification(`Project "${currentProject.name}" saved!`, 'success');
+    }
+
+    if (typeof window.markSceneAsSaved === 'function') {
+      window.markSceneAsSaved();
+    }
+
+    return Promise.resolve();
+  } catch (error) {
+    if (!silentMode) showNotification('Error saving project', 'error');
+    return Promise.reject(error);
+  }
+}
+
+
+// Enhanced save function with silent mode for auto-save
+async function saveProjectToFirebase(silentMode = false) {
+  if (!currentUser) {
+    if (!silentMode) showNotification('Please sign in to save your project', 'error');
+    return Promise.reject(new Error('Not authenticated'));
   }
   
   if (!currentProject) {
-    // No current project, show save as dialog
+    // No current project, show save as dialog only in manual mode
+    if (!silentMode) {
     showSaveAsModal();
-    return;
+    }
+    return Promise.reject(new Error('No current project'));
   }
   
   try {
@@ -650,16 +704,23 @@ async function saveProject() {
     currentProject.lastModified = new Date().toISOString();
     currentProject.modelCount = sceneData.models.length;
     
+    // Only show notification in manual mode
+    if (!silentMode) {
     showNotification(`Project "${currentProject.name}" saved!`, 'success');
+    }
     
     // Mark scene as saved
     if (typeof window.markSceneAsSaved === 'function') {
       window.markSceneAsSaved();
     }
     
+    return Promise.resolve();
   } catch (error) {
     console.error('Error saving project:', error);
+    if (!silentMode) {
     showNotification('Error saving project', 'error');
+    }
+    return Promise.reject(error);
   }
 }
 
@@ -699,7 +760,7 @@ function showSaveAsModal() {
         </div>
       </form>
       
-      <div id="save-as-error" class="error-message"></div>
+      <div id="save-as-error" class="error-message" style="display: none;"></div>
     </div>
   `;
   
@@ -715,11 +776,26 @@ function showSaveAsModal() {
     
     if (!name) {
       errorElement.textContent = 'Project name is required';
+      errorElement.style.display = 'block';
       return;
     }
     
     try {
       errorElement.textContent = '';
+      errorElement.style.display = 'none';
+      
+      // Check if project name already exists for this user
+      const projectsQuery = query(collection(db, 'projects'), 
+        where('userId', '==', currentUser.uid),
+        where('name', '==', name));
+      const existingProjects = await getDocs(projectsQuery);
+      
+      if (!existingProjects.empty) {
+        errorElement.textContent = 'A project with this name already exists. Please choose a different name.';
+        errorElement.style.display = 'block';
+        showNotification('Project name already exists', 'error');
+        return;
+      }
       
       const sceneData = getCurrentSceneData();
       
@@ -754,6 +830,7 @@ function showSaveAsModal() {
     } catch (error) {
       console.error('Error saving project:', error);
       errorElement.textContent = 'Error saving project. Please try again.';
+      errorElement.style.display = 'block';
     }
   });
   
@@ -776,60 +853,109 @@ function getCurrentSceneData() {
   const modelInstances = window.modelInstances || [];
   const currentCamera = window.currentCamera;
   const orbit = window.orbit;
-  
+
   const models = modelInstances.map(instance => ({
     name: instance.name,
-    position: {
-      x: instance.model.position.x,
-      y: instance.model.position.y,
-      z: instance.model.position.z
-    },
-    rotation: {
-      x: instance.model.rotation.x,
-      y: instance.model.rotation.y,
-      z: instance.model.rotation.z
-    },
-    scale: instance.scale || 1
+    position: instance.model.position.toArray(),
+    rotation: instance.model.rotation.toArray(),
+    scale: instance.model.scale.toArray ? instance.model.scale.toArray() : [1, 1, 1],
+    uuid: instance.model.uuid
   }));
-  
+
   const camera = currentCamera ? {
-    position: {
-      x: currentCamera.position.x,
-      y: currentCamera.position.y,
-      z: currentCamera.position.z
-    },
-    target: orbit ? {
-      x: orbit.target.x,
-      y: orbit.target.y,
-      z: orbit.target.z
-    } : { x: 0, y: 0, z: 0 },
+    position: currentCamera.position.toArray(),
+    target: orbit ? orbit.target.toArray() : [0, 0, 0],
     type: currentCamera.isPerspectiveCamera ? 'perspective' : 'orthographic'
   } : {};
-  
+
   const settings = {
     shadows: document.getElementById('showShadows')?.checked || false,
     ambientLight: parseFloat(document.getElementById('ambientLight')?.value || 0),
     directLight: parseFloat(document.getElementById('directLight')?.value || 2)
   };
-  
+
+  const undoStack = window.undoStack || [];
+  const redoStack = window.redoStack || [];
+
+  const serializeStack = (stack) => {
+    return stack.map(action => {
+      const serializedAction = JSON.parse(JSON.stringify(action));
+
+      if (action.type === 'transform') {
+        if (action.oldPosition) {
+          serializedAction.oldPosition = {
+            x: action.oldPosition.x,
+            y: action.oldPosition.y,
+            z: action.oldPosition.z,
+            isVector3: true
+          };
+        }
+        if (action.newPosition) {
+          serializedAction.newPosition = {
+            x: action.newPosition.x,
+            y: action.newPosition.y,
+            z: action.newPosition.z,
+            isVector3: true
+          };
+        }
+        if (action.oldRotation) {
+          serializedAction.oldRotation = {
+            x: action.oldRotation.x,
+            y: action.oldRotation.y,
+            z: action.oldRotation.z,
+            isEuler: true
+          };
+        }
+        if (action.newRotation) {
+          serializedAction.newRotation = {
+            x: action.newRotation.x,
+            y: action.newRotation.y,
+            z: action.newRotation.z,
+            isEuler: true
+          };
+        }
+        if (action.oldScale) {
+          serializedAction.oldScale = {
+            x: action.oldScale.x,
+            y: action.oldScale.y,
+            z: action.oldScale.z,
+            isVector3: true
+          };
+        }
+        if (action.newScale) {
+          serializedAction.newScale = {
+            x: action.newScale.x,
+            y: action.newScale.y,
+            z: action.newScale.z,
+            isVector3: true
+          };
+        }
+      }
+      return serializedAction;
+    });
+  };
+
   return {
-    models: models,
-    camera: camera,
-    settings: settings
+    models,
+    camera,
+    settings,
+    lastSaved: new Date().toISOString(),
+    undoStack: serializeStack(undoStack),
+    redoStack: serializeStack(redoStack)
   };
 }
 
+
 // Load project scene data
 function loadProjectScene(sceneData) {
-  // Clear current scene first
   const clearScene = window.clearScene;
   const modelInstances = window.modelInstances;
   const controlsList = window.controlsList;
   const scene = window.scene;
   const updateSceneStats = window.updateSceneStats;
-  
+  const deselectAllModels = window.deselectAllModels;
+
   if (clearScene && typeof clearScene === 'function') {
-    // Clear without confirmation when loading project
     modelInstances.forEach(instance => {
       scene.remove(instance.model);
       scene.remove(instance.control);
@@ -837,55 +963,86 @@ function loadProjectScene(sceneData) {
     modelInstances.length = 0;
     controlsList.length = 0;
     updateSceneStats();
+
+    if (deselectAllModels && typeof deselectAllModels === 'function') {
+      deselectAllModels();
+    }
   }
-  
+
   // Load models
   if (sceneData.models && sceneData.models.length > 0) {
+    let modelsToLoad = sceneData.models.length;
+    let modelsLoaded = 0;
+
     sceneData.models.forEach(modelData => {
-      loadModelFromData(modelData);
+      try {
+        // Fix: Convert array formats back to THREE objects if needed
+        if (Array.isArray(modelData.position)) {
+          modelData.position = new THREE.Vector3(...modelData.position);
+        }
+        if (Array.isArray(modelData.rotation)) {
+          modelData.rotation = new THREE.Euler(...modelData.rotation);
+        }
+        if (Array.isArray(modelData.scale)) {
+          modelData.scale = new THREE.Vector3(...modelData.scale);
+        }
+
+        loadModelFromData(modelData, () => {
+          modelsLoaded++;
+          if (modelsLoaded >= modelsToLoad) {
+            console.log("All models loaded, ensuring nothing is selected");
+            setTimeout(() => {
+              if (deselectAllModels && typeof deselectAllModels === 'function') {
+                deselectAllModels();
+              }
+            }, 100);
+          }
+        });
+      } catch (error) {
+        console.error("Error loading model:", error);
+        modelsLoaded++;
+      }
     });
   }
-  
-  // Load camera settings
+
+  // Load camera
   if (sceneData.camera) {
     setTimeout(() => {
       const currentCamera = window.currentCamera;
       const orbit = window.orbit;
       const scheduleRender = window.scheduleRender;
-      
+
       if (sceneData.camera.position && currentCamera) {
-        currentCamera.position.set(
-          sceneData.camera.position.x,
-          sceneData.camera.position.y,
-          sceneData.camera.position.z
-        );
+        const pos = Array.isArray(sceneData.camera.position)
+          ? sceneData.camera.position
+          : [sceneData.camera.position.x, sceneData.camera.position.y, sceneData.camera.position.z];
+        currentCamera.position.set(...pos);
       }
-      
+
       if (sceneData.camera.target && orbit) {
-        orbit.target.set(
-          sceneData.camera.target.x,
-          sceneData.camera.target.y,
-          sceneData.camera.target.z
-        );
+        const tgt = Array.isArray(sceneData.camera.target)
+          ? sceneData.camera.target
+          : [sceneData.camera.target.x, sceneData.camera.target.y, sceneData.camera.target.z];
+        orbit.target.set(...tgt);
       }
-      
+
       if (orbit) orbit.update();
       if (scheduleRender) scheduleRender();
     }, 500);
   }
-  
-  // Load scene settings
+
+  // Load settings
   if (sceneData.settings) {
     setTimeout(() => {
       const hemiLight = window.hemiLight;
       const dirLight = window.dirLight;
       const scheduleRender = window.scheduleRender;
-      
+
       if (sceneData.settings.shadows !== undefined) {
         const shadowsCheckbox = document.getElementById('showShadows');
         if (shadowsCheckbox) shadowsCheckbox.checked = sceneData.settings.shadows;
       }
-      
+
       if (sceneData.settings.ambientLight !== undefined) {
         const ambientSlider = document.getElementById('ambientLight');
         if (ambientSlider) {
@@ -893,7 +1050,7 @@ function loadProjectScene(sceneData) {
           if (hemiLight) hemiLight.intensity = sceneData.settings.ambientLight;
         }
       }
-      
+
       if (sceneData.settings.directLight !== undefined) {
         const directSlider = document.getElementById('directLight');
         if (directSlider) {
@@ -901,21 +1058,117 @@ function loadProjectScene(sceneData) {
           if (dirLight) dirLight.intensity = sceneData.settings.directLight;
         }
       }
-      
+
       if (scheduleRender) scheduleRender();
     }, 100);
   }
-  
-  // Mark scene as saved since we just loaded a project
+
+  // Restore undo stack
+  if (sceneData.undoStack && Array.isArray(sceneData.undoStack)) {
+    console.log("Restoring undo stack with", sceneData.undoStack.length, "items");
+
+    const processedUndoStack = sceneData.undoStack.map(action => {
+      const processedAction = JSON.parse(JSON.stringify(action));
+
+      if (action.type === 'transform') {
+        if (action.oldPosition) {
+          processedAction.oldPosition = new THREE.Vector3(
+            action.oldPosition.x, action.oldPosition.y, action.oldPosition.z
+          );
+        }
+        if (action.newPosition) {
+          processedAction.newPosition = new THREE.Vector3(
+            action.newPosition.x, action.newPosition.y, action.newPosition.z
+          );
+        }
+        if (action.oldRotation) {
+          processedAction.oldRotation = new THREE.Euler(
+            action.oldRotation.x, action.oldRotation.y, action.oldRotation.z
+          );
+        }
+        if (action.newRotation) {
+          processedAction.newRotation = new THREE.Euler(
+            action.newRotation.x, action.newRotation.y, action.newRotation.z
+          );
+        }
+        if (action.oldScale) {
+          processedAction.oldScale = new THREE.Vector3(
+            action.oldScale.x, action.oldScale.y, action.oldScale.z
+          );
+        }
+        if (action.newScale) {
+          processedAction.newScale = new THREE.Vector3(
+            action.newScale.x, action.newScale.y, action.newScale.z
+          );
+        }
+      }
+
+      return processedAction;
+    });
+
+    window.undoStack = processedUndoStack;
+  }
+
+  // Restore redo stack
+  if (sceneData.redoStack && Array.isArray(sceneData.redoStack)) {
+    console.log("Restoring redo stack with", sceneData.redoStack.length, "items");
+
+    const processedRedoStack = sceneData.redoStack.map(action => {
+      const processedAction = JSON.parse(JSON.stringify(action));
+
+      if (action.type === 'transform') {
+        if (action.oldPosition) {
+          processedAction.oldPosition = new THREE.Vector3(
+            action.oldPosition.x, action.oldPosition.y, action.oldPosition.z
+          );
+        }
+        if (action.newPosition) {
+          processedAction.newPosition = new THREE.Vector3(
+            action.newPosition.x, action.newPosition.y, action.newPosition.z
+          );
+        }
+        if (action.oldRotation) {
+          processedAction.oldRotation = new THREE.Euler(
+            action.oldRotation.x, action.oldRotation.y, action.oldRotation.z
+          );
+        }
+        if (action.newRotation) {
+          processedAction.newRotation = new THREE.Euler(
+            action.newRotation.x, action.newRotation.y, action.newRotation.z
+          );
+        }
+        if (action.oldScale) {
+          processedAction.oldScale = new THREE.Vector3(
+            action.oldScale.x, action.oldScale.y, action.oldScale.z
+          );
+        }
+        if (action.newScale) {
+          processedAction.newScale = new THREE.Vector3(
+            action.newScale.x, action.newScale.y, action.newScale.z
+          );
+        }
+      }
+
+      return processedAction;
+    });
+
+    window.redoStack = processedRedoStack;
+  }
+
+  // Final cleanup and saved mark
   setTimeout(() => {
+    if (deselectAllModels && typeof deselectAllModels === 'function') {
+      deselectAllModels();
+    }
     if (typeof window.markSceneAsSaved === 'function') {
       window.markSceneAsSaved();
     }
-  }, 600); // Wait a bit longer to ensure all models are loaded
+  }, 1000);
 }
 
+
 // Load a single model from saved data
-function loadModelFromData(modelData) {
+function loadModelFromData(modelData, callback) {
   const models = window.models || {};
   const importedModels = window.importedModels || {};
   const allModels = { ...models, ...importedModels };
@@ -924,6 +1177,7 @@ function loadModelFromData(modelData) {
   
   if (!modelConfig) {
     console.error('Model config not found for:', modelData.name);
+    if (callback && typeof callback === 'function') callback();
     return;
   }
   
@@ -942,12 +1196,22 @@ function loadModelFromData(modelData) {
   
   if (!GLTFLoader || !scene || !currentCamera) {
     console.error('Required Three.js components not available');
+    if (callback && typeof callback === 'function') callback();
     return;
   }
   
   const loader = new GLTFLoader();
   loader.load(modelConfig.url, (gltf) => {
     const model = gltf.scene;
+    
+    // Store original model ID in userData for reference
+    if (modelData.uuid) {
+      model.userData.originalModelId = modelData.uuid;
+      
+      // Update the global ID mapping
+      if (!window.modelIdMapping) window.modelIdMapping = {};
+      window.modelIdMapping[modelData.uuid] = model.uuid;
+    }
     
     // Set position
     model.position.set(
@@ -993,7 +1257,57 @@ function loadModelFromData(modelData) {
     control.setSize(0.8);
     control.addEventListener('dragging-changed', (event) => {
       if (orbit) orbit.enabled = !event.value;
+      
+      // Add undo/redo support for transform changes
+      if (event.value === false && control.object) { // Dragging ended
+        const currentTransformState = {
+            position: control.object.position.clone(),
+            scale: control.object.scale.clone(),
+            rotation: control.object.rotation.clone()
+        };
+        // Find the modelInstance associated with this control.object
+        const instance = modelInstances.find(inst => inst.model === control.object);
+        if (instance && instance.initialTransformState) {
+            // Only push to undo stack if there was an actual change
+            if (!instance.initialTransformState.position.equals(currentTransformState.position) ||
+                !instance.initialTransformState.scale.equals(currentTransformState.scale) ||
+                !instance.initialTransformState.rotation.equals(currentTransformState.rotation)) {
+
+                if (window.undoStack) {
+                    window.undoStack.push({
+                        type: 'transform',
+                        modelId: control.object.uuid,
+                        oldPosition: instance.initialTransformState.position,
+                        oldScale: instance.initialTransformState.scale,
+                        oldRotation: instance.initialTransformState.rotation,
+                        newPosition: currentTransformState.position,
+                        newScale: currentTransformState.scale,
+                        newRotation: currentTransformState.rotation
+                    });
+                    if (window.undoStack.length > window.MAX_HISTORY_STATES) {
+                        window.undoStack.shift();
+                    }
+                }
+                
+                if (window.redoStack) {
+                    window.redoStack.length = 0; // Clear redo stack on new action
+                }
+            }
+            instance.initialTransformState = null; // Reset initial state
+        }
+      } else if (event.value === true && control.object) { // Dragging started
+          // Store the state of the object *before* the transformation begins
+          const instance = modelInstances.find(inst => inst.model === control.object);
+          if (instance) {
+              instance.initialTransformState = {
+                  position: control.object.position.clone(),
+                  scale: control.object.scale.clone(),
+                  rotation: control.object.rotation.clone()
+              };
+          }
+      }
     });
+    
     control.addEventListener('change', () => {
       if (window.markSceneAsChanged) window.markSceneAsChanged();
       if (scheduleRender) scheduleRender();
@@ -1012,15 +1326,27 @@ function loadModelFromData(modelData) {
       model: model,
       control: control,
       name: modelData.name,
-      scale: modelData.scale
+      scale: modelData.scale,
+      modelConfig: modelConfig,
+      modelUrl: modelConfig.url
     };
     if (modelInstances) modelInstances.push(modelInstance);
+    
+    // Update ID mapping for undo/redo
+    if (modelData.uuid && window.modelIdMapping) {
+      window.modelIdMapping[modelData.uuid] = model.uuid;
+    }
     
     if (updateSceneStats) updateSceneStats();
     if (scheduleRender) scheduleRender();
     
+    // Call the callback function if provided
+    if (callback && typeof callback === 'function') callback();
+    
   }, undefined, (error) => {
     console.error('Error loading model:', modelData.name, error);
+    // Call the callback even on error to ensure loading process continues
+    if (callback && typeof callback === 'function') callback();
   });
 }
 
@@ -1054,6 +1380,7 @@ function showNotification(message, type = 'info') {
 
 // Export functions for use in other modules
 window.saveProject = saveProject;
+window.saveProjectToFirebase = saveProjectToFirebase; // Export the enhanced save function for auto-save
 window.showSaveAsModal = showSaveAsModal;
 window.openProject = openProject;
 window.deleteProject = deleteProject;
