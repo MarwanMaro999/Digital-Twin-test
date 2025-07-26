@@ -4,6 +4,7 @@ import { TransformControls } from 'jsm/controls/TransformControls.js';
 import { GLTFLoader } from 'jsm/loaders/GLTFLoader.js';
 
 let cameraPersp, cameraOrtho, currentCamera;
+let isPerformingHistory = false;
 let scene, renderer, orbit;
 let mapSurface, gridHelper;
 let hemiLight, dirLight;
@@ -17,16 +18,25 @@ const mouse = new THREE.Vector2();
 // Store the last used transform mode
 let lastTransformMode = 'transform';
 
-// Track unsaved changes
+// Track unsaved changes and save status
 let hasUnsavedChanges = false;
 window.hasUnsavedChanges = () => hasUnsavedChanges;
 let lastSavedSceneState = null;
 let hasShownChangeNotification = false; // Track if we've already shown the change notification
+let autoSaveInProgress = false; // Track if auto-save is currently in progress
+let pendingChanges = false; // Track if changes occurred during auto-save
+let lastAutoSaveTime = Date.now(); // Track when the last auto-save occurred
+let autoSaveTimeout = null; // Timeout for scheduled auto-saves
 
 // --- Undo/Redo Feature Variables ---
-const undoStack = [];
-const redoStack = [];
-const MAX_HISTORY_STATES = 50; // Limit the size of the undo/redo stacks
+window.undoStack = [];
+window.redoStack = [];
+window.MAX_HISTORY_STATES = 50; // Limit the size of the undo/redo stacks
+
+// Aliases for easier local use
+const undoStack = window.undoStack;
+const redoStack = window.redoStack;
+const MAX_HISTORY_STATES = window.MAX_HISTORY_STATES;
 
 // Variable to store the state of the object *before* a transformation
 let initialTransformState = null;
@@ -165,6 +175,11 @@ function markSceneAsChanged() {
     hasUnsavedChanges = true;
     saveSceneToCache();
     updateProjectNameDisplay();
+
+    // Schedule auto-save when changes are made
+    if (typeof window.scheduleAutoSave === 'function') {
+      window.scheduleAutoSave(2000); // Wait 2 seconds of inactivity before saving
+    }
   }
 }
 
@@ -228,13 +243,32 @@ function captureSceneState() {
 function updateProjectNameDisplay() {
   const projectNameElement = document.getElementById('projectName');
   const currentProjectElement = document.getElementById('currentProject');
+  
   if (projectNameElement && currentProjectElement) {
     const projectName = projectNameElement.textContent.replace(' (unsaved)', '');
-    if (hasUnsavedChanges) {
-      projectNameElement.textContent = projectName + ' (unsaved)';
+    
+    // Update project name text
+    projectNameElement.textContent = projectName;
+    
+    // Check if status indicator exists, create if not
+    let statusIndicator = currentProjectElement.querySelector('.project-status');
+    if (!statusIndicator) {
+      statusIndicator = document.createElement('span');
+      statusIndicator.className = 'project-status';
+      currentProjectElement.appendChild(statusIndicator);
+    }
+    
+    // Update status indicator - with safe check for autoSaveInProgress
+    if (typeof autoSaveInProgress !== 'undefined' && autoSaveInProgress) {
+      statusIndicator.className = 'project-status saving';
+      statusIndicator.innerHTML = '<i class="fa-solid fa-cloud-arrow-up"></i> Saving...';
+    } else if (hasUnsavedChanges) {
+      statusIndicator.className = 'project-status unsaved';
+      statusIndicator.innerHTML = '<i class="fa-solid fa-circle"></i> Unsaved changes';
       currentProjectElement.style.color = '#e67e22'; // Orange color for unsaved
     } else {
-      projectNameElement.textContent = projectName;
+      statusIndicator.className = 'project-status saved';
+      statusIndicator.innerHTML = '<i class="fa-solid fa-check-circle"></i> Saved';
       currentProjectElement.style.color = '#666'; // Normal color
     }
   }
@@ -363,6 +397,13 @@ function onMouseMove(event) {
 
 // Model selection functions
 function selectModel(modelInstance) {
+  try {
+    // Check if modelInstance is valid
+    if (!modelInstance || !modelInstance.model || !modelInstance.control) {
+      console.warn("Invalid model instance provided to selectModel");
+      return;
+    }
+    
   // Deselect previous model
   deselectAllModels();
   
@@ -371,6 +412,27 @@ function selectModel(modelInstance) {
   selectedControl = modelInstance.control;
   
   // Show transform controls
+    try {
+      // First check if the model is valid before attaching controls
+      if (!modelInstance.model || !modelInstance.model.parent) {
+        console.warn("Model is not valid or not in scene, cannot attach controls");
+        return;
+      }
+      
+      // Check if control is valid
+      if (!modelInstance.control) {
+        console.warn("Transform control is not valid");
+        return;
+      }
+      
+      // Make sure the control is attached to the model
+      try {
+        // Re-attach the control to ensure it's properly connected
+        modelInstance.control.attach(modelInstance.model);
+      } catch (attachError) {
+        console.warn("Error attaching control to model:", attachError);
+      }
+      
   modelInstance.control.visible = true;
   modelInstance.control.enabled = true;
   
@@ -385,28 +447,51 @@ function selectModel(modelInstance) {
     modelInstance.control.showX = true;
     modelInstance.control.showY = false;
     modelInstance.control.showZ = true;
+      }
+    } catch (controlError) {
+      console.warn("Error setting up transform controls:", controlError);
   }
   
   // Update sidebar
+    try {
   updateSelectedModelControls(modelInstance);
+    } catch (sidebarError) {
+      console.warn("Error updating sidebar controls:", sidebarError);
+    }
   
   scheduleRender();
+  } catch (error) {
+    console.error("Error in selectModel:", error);
+  }
 }
 
 function deselectAllModels() {
-  selectedModel = null;
-  selectedControl = null;
-  
-  // Hide all transform controls
-  controlsList.forEach(control => {
-    control.visible = false;
-    control.enabled = false;
-  });
-  
-  // Update sidebar
-  updateSelectedModelControls(null);
-  
-  scheduleRender();
+    selectedModel = null;
+    selectedControl = null;
+    
+    // Hide all transform controls
+    controlsList.forEach(control => {
+        control.visible = false;
+        control.enabled = false;
+    });
+
+    // Force hide selection UI and show "No Selection" message
+    const selectedControls = document.querySelector('.selected-model-controls');
+    const noSelection = document.querySelector('.no-selection');
+    if (selectedControls) selectedControls.style.display = 'none';
+    if (noSelection) {
+        noSelection.style.display = 'block';
+        noSelection.innerHTML = `
+            <i class="fa-solid fa-mouse-pointer"></i>
+            <h4>No Model Selected</h4>
+            <p>Click on a model in the scene to edit its properties</p>
+        `;
+    }
+    
+    // Update sidebar
+    updateSelectedModelControls(null);
+    
+    scheduleRender();
 }
 
 // Scene management functions
@@ -496,8 +581,8 @@ window.clearSceneSilently = function () {
   selectedControl = null;
 
   // Clear undo/redo stacks
-  undoStack.length = 0;
-  redoStack.length = 0;
+  window.undoStack.length = 0;
+  window.redoStack.length = 0;
 
   updateSceneStats();
   updateSelectedModelControls(null);
@@ -543,6 +628,7 @@ modelsData.forEach(data => {
 
     // Track when user finishes dragging (undo/redo removed)
     control.addEventListener('dragging-changed', (event) => {
+      if (isPerformingHistory) return;
       orbit.enabled = !event.value;
       if (event.value === false && control.object) { // Dragging ended
         const currentTransformState = {
@@ -827,17 +913,41 @@ const CACHE_KEY = 'sceneCache';
 
 
 function saveSceneToCache() {
-  const data = scene.children
-    .filter(obj => obj.isMesh && obj.name !== 'MapSurface') // skip map/grid/etc.
-    .map(model => ({
-      name: model.userData.modelName || model.name,
-      position: model.position.toArray(),
-      scale: model.scale.toArray(),
-      rotation: model.rotation.toArray()
+  // Use modelInstances for more complete data
+  const data = modelInstances.map(instance => ({
+    name: instance.name,
+    position: instance.model.position.toArray(),
+    scale: instance.model.scale.toArray(),
+    rotation: instance.model.rotation.toArray(),
+    uuid: instance.model.uuid,
+    modelUrl: instance.modelUrl || instance.modelConfig?.url
     }));
   
+  try {
   localStorage.setItem(CACHE_KEY, JSON.stringify(data));
-  hasUnsavedChanges = false;
+    localStorage.setItem(CACHE_KEY + '_timestamp', Date.now().toString());
+    console.log(`[Cache] Saved ${data.length} models to local storage`);
+  } catch (error) {
+    console.error('[Cache] Error saving to localStorage:', error);
+    // Try to save with less data if quota exceeded
+    if (error.name === 'QuotaExceededError') {
+      try {
+        // Simplified data with just essential properties
+        const minimalData = data.map(item => ({
+          name: item.name,
+          position: item.position,
+          uuid: item.uuid
+        }));
+        localStorage.setItem(CACHE_KEY, JSON.stringify(minimalData));
+        console.log('[Cache] Saved minimal data as fallback');
+      } catch (fallbackError) {
+        console.error('[Cache] Even minimal save failed:', fallbackError);
+      }
+    }
+  }
+  
+  // Don't set hasUnsavedChanges to false here - that should only happen after Firebase save
+  // This allows auto-save to Firebase to still trigger even after local cache save
 }
 
 
@@ -913,7 +1023,7 @@ function init() {
   fillLight.position.set(-1000, 1000, -1000);
   scene.add(fillLight);
 
-  // Improved map setup
+  // // Improved map setup
   const mapTexture = new THREE.TextureLoader().load('./static/img/Lafarge Map.png', scheduleRender);
   mapTexture.wrapS = THREE.RepeatWrapping;
   mapTexture.wrapT = THREE.RepeatWrapping;
@@ -1539,6 +1649,47 @@ function init() {
     });
   }
 
+ // Make redo function globally available
+window.redo = redo;
+
+// Add a global error handler for TransformControls
+const originalTransformControls = THREE.TransformControls || TransformControls;
+if (originalTransformControls && originalTransformControls.prototype) {
+  // Save original method references
+  const originalPointerDown = originalTransformControls.prototype.pointerDown;
+  const originalOnPointerDown = originalTransformControls.prototype.onPointerDown;
+  
+  // Override pointerDown with error handling
+  originalTransformControls.prototype.pointerDown = function(pointer, axis) {
+    try {
+      // Check if object exists and has updateMatrixWorld
+      if (!this.object || typeof this.object.updateMatrixWorld !== 'function') {
+        console.warn('TransformControls: Invalid object or missing updateMatrixWorld method');
+        return false;
+      }
+      
+      // Call original method with proper this context
+      return originalPointerDown.call(this, pointer, axis);
+    } catch (error) {
+      console.warn('Error in TransformControls.pointerDown:', error);
+      return false;
+    }
+  };
+  
+  // Override onPointerDown with error handling
+  originalTransformControls.prototype.onPointerDown = function(event) {
+    try {
+      // Call original method with proper this context
+      return originalOnPointerDown.call(this, event);
+    } catch (error) {
+      console.warn('Error in TransformControls.onPointerDown:', error);
+      return false;
+    }
+  };
+  
+  console.log('Added safety wrappers to TransformControls methods');
+  }
+
  window.addEventListener('keydown', (event) => {
   // Don't process keyboard shortcuts when user is typing in input fields
   const isTyping = document.activeElement.tagName === 'INPUT' || 
@@ -1611,18 +1762,31 @@ function init() {
       }
       break;
 
-    case 'z':
-      if (event.ctrlKey || event.metaKey) {
-        event.preventDefault(); // Prevent browser default undo/redo
-        if (event.shiftKey) {
-          redo(); // Ctrl+Shift+Z
-        } else {
+      case 'z':
+        if (event.ctrlKey || event.metaKey) {
+          event.preventDefault(); // Prevent browser default undo
+          if (event.shiftKey) {
+            console.log("Ctrl+Shift+Z detected, calling redo");
+            redo(); // Ctrl+Shift+Z (alternative redo)
+          } else {
           undo(); // Ctrl+Z
+          }
+        } else if (selectedControl) {
+          selectedControl.showZ = !selectedControl.showZ; // Regular Z
         }
-      } else if (selectedControl) {
-        selectedControl.showZ = !selectedControl.showZ; // Regular Z
-      }
-      break;
+        break;
+        
+      case 'y':
+      case 'Y': // Add uppercase Y to handle Shift key or Caps Lock
+        console.log("Y key pressed, ctrl key:", event.ctrlKey, "meta key:", event.metaKey);
+        if (event.ctrlKey || event.metaKey) {
+          console.log("Ctrl+Y detected, calling redo function");
+          event.preventDefault(); // Prevent browser default redo
+          redo(); // Ctrl+Y
+        } else if (selectedControl) {
+          selectedControl.showY = !selectedControl.showY; // Regular Y
+        }
+        break;
 
     case ' ':
       if (!isTyping) {
@@ -1654,16 +1818,13 @@ function init() {
     case 's':
       if (event.ctrlKey || event.metaKey) {
         event.preventDefault();
-        const trySaveProject = (attempts = 0) => {
-          if (typeof window.saveProject === 'function') {
-            window.saveProject();
-          } else if (attempts < 10) {
-            setTimeout(() => trySaveProject(attempts + 1), 100);
+        // Trigger immediate auto-save instead of manual save
+        if (typeof window.performAutoSave === 'function') {
+          window.performAutoSave();
+          showNotification('Auto-saving in progress...', 'info');
           } else {
-            showNotification('Authentication system not loaded', 'error');
+          showNotification('Auto-save system not initialized', 'error');
           }
-        };
-        trySaveProject();
       }
       break;
 
@@ -1734,13 +1895,130 @@ function init() {
   });
 
   window.addEventListener('resize', onWindowResize);
-  // Auto-save every 5 seconds if there are unsaved changes
-  setInterval(() => {
-  if (hasUnsavedChanges) {
-    console.log('[AutoSave] Saving scene...');
+  // Robust auto-save implementation with throttling and Firebase integration
+  // Note: Variables are now defined globally at the top of the file
+  
+  // Function to perform auto-save with throttling
+  window.performAutoSave = async function() {
+    // Clear any pending timeout
+    if (autoSaveTimeout) {
+      clearTimeout(autoSaveTimeout);
+      autoSaveTimeout = null;
+    }
+    
+    // Don't save if save already in progress
+    if (autoSaveInProgress) {
+      pendingChanges = true;
+      return;
+    }
+    
+    // Set flag to prevent multiple concurrent saves
+    autoSaveInProgress = true;
+    pendingChanges = false;
+    
+    // Update status display immediately
+    updateProjectNameDisplay();
+    
+    try {
+      // Always save to localStorage as backup
     saveSceneToCache();
-  }
+      
+      // Show subtle saving indicator
+      const saveIndicator = document.createElement('div');
+      saveIndicator.className = 'auto-save-indicator';
+      saveIndicator.innerHTML = '<i class="fa-solid fa-cloud-arrow-up"></i> Auto-saving...';
+      document.body.appendChild(saveIndicator);
+      
+      // Try to save to Firebase if user is logged in and project exists
+      if (typeof window.saveProjectToFirebase === 'function') {
+        await window.saveProjectToFirebase(true); // true = silent mode (no success notification)
+        console.log('[AutoSave] Saved to Firebase successfully');
+        
+        // Only mark as saved if Firebase save was successful
+        hasUnsavedChanges = false;
+      } else {
+        console.log('[AutoSave] Saved to local storage only (user not logged in or no project)');
+        // Keep hasUnsavedChanges true if we only saved to localStorage
+      }
+      
+      // Update last save time
+      lastAutoSaveTime = Date.now();
+      
+      // Remove indicator with success class briefly before removing
+      saveIndicator.innerHTML = '<i class="fa-solid fa-check"></i> Saved';
+      saveIndicator.classList.add('success');
+      setTimeout(() => {
+        saveIndicator.classList.add('fade-out');
+        setTimeout(() => {
+          if (saveIndicator.parentNode) {
+            saveIndicator.parentNode.removeChild(saveIndicator);
+          }
+        }, 500);
 }, 1000);
+    } catch (error) {
+      console.error('[AutoSave] Error:', error);
+      
+      // Show error indicator
+      const saveIndicator = document.querySelector('.auto-save-indicator');
+      if (saveIndicator) {
+        saveIndicator.innerHTML = '<i class="fa-solid fa-exclamation-triangle"></i> Save failed';
+        saveIndicator.classList.add('error');
+        setTimeout(() => {
+          saveIndicator.classList.add('fade-out');
+          setTimeout(() => {
+            if (saveIndicator.parentNode) {
+              saveIndicator.parentNode.removeChild(saveIndicator);
+            }
+          }, 500);
+        }, 3000);
+      }
+      
+      // Mark that we still have unsaved changes
+      hasUnsavedChanges = true;
+    } finally {
+      // Reset flag to allow future saves
+      autoSaveInProgress = false;
+      
+      // Update status display again after save completes
+      updateProjectNameDisplay();
+      
+      // If changes occurred during save, schedule another save
+      if (pendingChanges) {
+        window.scheduleAutoSave(5000); // Wait 5 seconds before trying again
+      }
+    }
+  };
+  
+  // Function to schedule auto-save with throttling
+  window.scheduleAutoSave = function(delay = 2000) {
+    // If a save is in progress, just mark that we have pending changes
+    if (autoSaveInProgress) {
+      pendingChanges = true;
+      return;
+    }
+    
+    // Clear any existing timeout
+    if (autoSaveTimeout) {
+      clearTimeout(autoSaveTimeout);
+    }
+    
+    // Schedule new save
+    autoSaveTimeout = setTimeout(performAutoSave, delay);
+  };
+  
+  // Set up auto-save interval (check every 5 seconds if save needed)
+  setInterval(() => {
+    if (hasUnsavedChanges && !autoSaveInProgress && !autoSaveTimeout) {
+      // Throttle saves to at most once every 30 seconds
+      const timeSinceLastSave = Date.now() - lastAutoSaveTime;
+      if (timeSinceLastSave >= 30000) {
+        window.performAutoSave();
+      } else {
+        // Schedule save when the throttle period completes
+        window.scheduleAutoSave(30000 - timeSinceLastSave);
+      }
+    }
+  }, 5000);
 
 
 
@@ -1765,6 +2043,7 @@ renderer.domElement.addEventListener('drop', (event) => {
   
   if (!modelConfig) {
     console.error('Model config not found for:', modelName);
+    showNotification(`Error: Model configuration not found for ${modelName}`, 'error');
     return;
   }
 
@@ -1784,10 +2063,12 @@ renderer.domElement.addEventListener('drop', (event) => {
   const dropPoint = intersects[0].point;
 
   const loader = new GLTFLoader();
-  loader.load(modelURL, (gltf) => {
-    const model = gltf.scene;
-    model.position.copy(dropPoint);
-    model.rotation.set(0, 0, 0);
+  loader.load(modelURL, 
+    // Success callback
+    (gltf) => {
+      const model = gltf.scene;
+      model.position.copy(dropPoint);
+      model.rotation.set(0, 0, 0);
 
     // Apply scaling based on model type
     let finalScale;
@@ -1861,6 +2142,7 @@ renderer.domElement.addEventListener('drop', (event) => {
     control.enabled = false;
 
     control.addEventListener('dragging-changed', (event) => {
+      if (isPerformingHistory) return;
       orbit.enabled = !event.value;
       if (event.value === false && control.object) { // Dragging ended
         const currentTransformState = {
@@ -1926,8 +2208,17 @@ renderer.domElement.addEventListener('drop', (event) => {
     updateSceneStats();
     selectModel(modelInstance);
     
-    // Record 'add' action for undo
-    undoStack.push({ type: 'add', modelId: model.uuid, modelConfig: modelConfig, initialPosition: model.position.clone(), initialRotation: model.rotation.clone(), initialScale: model.scale.clone() });
+    // Record 'add' action for undo with complete information
+    undoStack.push({ 
+      type: 'add', 
+      modelId: model.uuid, 
+      modelConfig: modelConfig, 
+      initialPosition: model.position.clone(), 
+      initialRotation: model.rotation.clone(), 
+      initialScale: model.scale.clone(),
+      name: uniqueName,
+      modelUrl: modelConfig.url // Store URL directly for easier recovery
+    });
     if (undoStack.length > MAX_HISTORY_STATES) {
         undoStack.shift();
     }
@@ -1935,8 +2226,15 @@ renderer.domElement.addEventListener('drop', (event) => {
     console.log("Model added (from drop). Stack size:", undoStack.length);
 
     scheduleRender();
-  }, undefined, (error) => {
+  }, 
+  // Progress callback
+  (xhr) => {
+    console.log(`${modelName} loading: ${(xhr.loaded / xhr.total * 100).toFixed(0)}%`);
+  }, 
+  // Error callback
+  (error) => {
     console.error('Error loading model:', error);
+    showNotification(`Error loading model: ${modelName}. Please check if the model file is valid.`, 'error');
   });
 });
 
@@ -1970,9 +2268,14 @@ renderer.domElement.addEventListener('drop', (event) => {
             <i class="fa-solid fa-folder-open"></i>
             <span>Projects</span>
           </button>
-          <button class="btn-toolbar" id="saveProject" title="Save Current Project">
-            <i class="fa-solid fa-save"></i>
-            <span>Save</span>
+        </div>
+        
+        <div class="toolbar-group edit-group">
+          <button class="btn-toolbar" id="undoBtn" title="Undo (Ctrl+Z)">
+            <i class="fa-solid fa-undo"></i>
+          </button>
+          <button class="btn-toolbar" id="redoBtn" title="Redo (Ctrl+Y)">
+            <i class="fa-solid fa-redo"></i>
           </button>
         </div>
         
@@ -2057,12 +2360,13 @@ renderer.domElement.addEventListener('drop', (event) => {
           </ul>
         </div>
         
-        <div class="help-section"<h5><i class="fa-solid fa-keyboard"></i> Shortcuts</h5>
+        <div class="help-section">
+          <h5><i class="fa-solid fa-keyboard"></i> Shortcuts</h5>
           <ul>
             <li><strong>Ctrl+S</strong> Save project</li>
             <li><strong>Ctrl+P</strong> Manage projects</li>
             <li><strong>Ctrl+Z</strong> Undo last action</li>
-            <li><strong>Ctrl+Shift+Z</strong> Redo last action</li>
+            <li><strong>Ctrl+Shift+Z</strong> Redo action</li>
             <li><strong>+/-</strong> Resize gizmo</li>
           </ul>
         </div>
@@ -2089,139 +2393,93 @@ renderer.domElement.addEventListener('drop', (event) => {
     }
   });
   
+  // Add undo/redo button event listeners
+  document.getElementById('undoBtn').addEventListener('click', () => {
+    console.log("Undo button clicked");
+    undo();
+  });
+  
+  document.getElementById('redoBtn').addEventListener('click', () => {
+    console.log("Redo button clicked");
+    redo();
+  });
+  
   document.getElementById('manageProjects').addEventListener('click', () => {
-    // Check for unsaved changes before proceeding
-    if (window.hasUnsavedChanges && window.hasUnsavedChanges()) {
-      window.showSaveConfirmationDialog(
-        'opening projects manager',
-        // On Save: save project then show projects
-        () => {
-          const trySaveProject = (attempts = 0) => {
-            if (typeof window.saveProject === 'function') {
-              window.saveProject().then(() => {
-                // After saving, show projects modal
-                setTimeout(() => {
-                  if (typeof window.showProjectsModal === 'function') {
-                    window.showProjectsModal();
-                  }
-                }, 100);
-              });
-            } else if (attempts < 10) {
-              setTimeout(() => trySaveProject(attempts + 1), 100);
-            } else {
-              showNotification('Authentication system not loaded', 'error');
+    // Force an immediate auto-save before proceeding
+    const forceSaveBeforeNavigation = async () => {
+      try {
+        // Show notification that we're saving
+        showNotification('Saving your changes...', 'info');
+        
+        // Force immediate save to both localStorage and Firebase
+        saveSceneToCache();
+        
+        if (typeof window.saveProjectToFirebase === 'function') {
+          await window.saveProjectToFirebase(true);
+          console.log('[Navigation] Forced save completed successfully');
             }
-          };
-          trySaveProject();
-        },
-        // On Don't Save: show projects directly
-        () => {
-          const tryShowProjects = (attempts = 0) => {
+        
+        // Now show the projects modal
             if (typeof window.showProjectsModal === 'function') {
               window.showProjectsModal();
-            } else if (attempts < 10) {
-              setTimeout(() => tryShowProjects(attempts + 1), 100);
             } else {
-              showNotification('Authentication system not loaded', 'error');
+          showNotification('Projects system not loaded', 'error');
             }
-          };
-          tryShowProjects();
-        },
-        // On Cancel: do nothing
-        null
-      );
-    } else {
-      // No unsaved changes, proceed normally
-      const tryShowProjects = (attempts = 0) => {
+      } catch (error) {
+        console.error('[Navigation] Error during forced save:', error);
+        
+        // Ask user if they want to proceed anyway
+        if (confirm('Some changes may not have been saved. Continue anyway?')) {
         if (typeof window.showProjectsModal === 'function') {
           window.showProjectsModal();
-        } else if (attempts < 10) {
-          setTimeout(() => tryShowProjects(attempts + 1), 100);
-        } else {
-          showNotification('Authentication system not loaded', 'error');
+          }
         }
-      };
-      tryShowProjects();
-    }
-  });
-  document.getElementById('saveProject').addEventListener('click', () => {
-    // Wait for auth system to load with retry
-    const trySaveProject = (attempts = 0) => {
-      if (typeof window.saveProject === 'function') {
-        window.saveProject();
-      } else if (attempts < 10) {
-        setTimeout(() => trySaveProject(attempts + 1), 100);
-      } else {
-        showNotification('Authentication system not loaded', 'error');
       }
     };
-    trySaveProject();
+    
+    // Always force a save before navigating
+    forceSaveBeforeNavigation();
   });
+  // Remove save button as it's replaced by auto-save
+  const saveButton = document.getElementById('saveProject');
+  if (saveButton) {
+    saveButton.parentNode.removeChild(saveButton);
+  }
   document.getElementById('logoutBtn').addEventListener('click', () => {
-    console.log('Logout button clicked');
-    console.log('hasUnsavedChanges function exists:', typeof window.hasUnsavedChanges);
-    console.log('hasUnsavedChanges value:', window.hasUnsavedChanges ? window.hasUnsavedChanges() : 'function not available');
+    // Force an immediate auto-save before logging out
+    const forceSaveBeforeLogout = async () => {
+      try {
+        // Show notification that we're saving
+        showNotification('Saving your changes before logout...', 'info');
     
-    // Show visual notification that logout was clicked
-    showNotification('Logout clicked - checking for unsaved changes...', 'info');
-    
-    // Check for unsaved changes before proceeding
-    if (window.hasUnsavedChanges && window.hasUnsavedChanges()) {
-      console.log('Showing save confirmation dialog');
-      showNotification('Unsaved changes detected! Showing save dialog...', 'warning');
-      window.showSaveConfirmationDialog(
-        'logging out',
-        // On Save: save project then logout
-        () => {
-          const trySaveProject = (attempts = 0) => {
-            if (typeof window.saveProject === 'function') {
-              window.saveProject().then(() => {
-                // After saving, logout
-                setTimeout(() => {
-                  if (typeof window.logoutUser === 'function') {
-                    window.logoutUser();
-                  }
-                }, 100);
-              });
-            } else if (attempts < 10) {
-              setTimeout(() => trySaveProject(attempts + 1), 100);
-            } else {
-              showNotification('Authentication system not loaded', 'error');
+        // Force immediate save to both localStorage and Firebase
+        saveSceneToCache();
+        
+        if (typeof window.saveProjectToFirebase === 'function') {
+          await window.saveProjectToFirebase(true);
+          console.log('[Logout] Forced save completed successfully');
             }
-          };
-          trySaveProject();
-        },
-        // On Don't Save: logout directly
-        () => {
-          const tryLogout = (attempts = 0) => {
+        
+        // Now proceed with logout
             if (typeof window.logoutUser === 'function') {
               window.logoutUser();
-            } else if (attempts < 10) {
-              setTimeout(() => tryLogout(attempts + 1), 100);
             } else {
               showNotification('Authentication system not loaded', 'error');
             }
-          };
-          tryLogout();
-        },
-        // On Cancel: do nothing
-        null
-      );
-    } else {
-      console.log('No unsaved changes, proceeding with normal logout');
-      showNotification('No unsaved changes - proceeding with logout', 'success');
-      // No unsaved changes, proceed normally
-      const tryLogout = (attempts = 0) => {
+      } catch (error) {
+        console.error('[Logout] Error during forced save:', error);
+        
+        // Ask user if they want to proceed anyway
+        if (confirm('Some changes may not have been saved. Log out anyway?')) {
         if (typeof window.logoutUser === 'function') {
           window.logoutUser();
-        } else if (attempts < 10) {
-          setTimeout(() => tryLogout(attempts + 1), 100);
-        } else {
-          showNotification('Authentication system not loaded', 'error');
         }
-      };
-      tryLogout();
     }
+      }
+    };
+    
+    // Always force a save before logging out
+    forceSaveBeforeLogout();
   });
   document.getElementById('clearScene').addEventListener('click', clearScene);
   document.getElementById('screenshot').addEventListener('click', takeScreenshot);
@@ -2381,14 +2639,20 @@ async function handleUserModelImport(url, name) {
 }
 
 // Update selected model controls in sidebar
+// Full replacement of updateSelectedModelControls with added scale slider + undo
 function updateSelectedModelControls(modelInstance) {
+  try {
+    // First check if the required DOM elements exist
   const selectedControls = document.querySelector('.selected-model-controls');
   const noSelection = document.querySelector('.no-selection');
-  
+    
+    if (!selectedControls || !noSelection) {
+      console.warn("Required DOM elements for model controls not found");
+      return;
+    }
+
   if (!modelInstance) {
-    // No model selected
     if (modelInstances.length === 0) {
-      // No models in scene, show default message
       selectedControls.style.display = 'none';
       noSelection.style.display = 'block';
       noSelection.innerHTML = `
@@ -2398,10 +2662,8 @@ function updateSelectedModelControls(modelInstance) {
       `;
       return;
     } else {
-      // There are models in the scene, show list
       selectedControls.style.display = 'block';
       noSelection.style.display = 'none';
-      // List all models in the scene (styled like Library tab)
       selectedControls.innerHTML = `
         <div class="scene-model-list">
           <h4 style="margin-bottom:10px;display:flex;align-items:center;gap:8px;">
@@ -2421,13 +2683,11 @@ function updateSelectedModelControls(modelInstance) {
           </div>
         </div>
       `;
-      // Add click listeners to each item
       selectedControls.querySelectorAll('.scene-model-list-item').forEach(item => {
-        item.addEventListener('click', function() {
+        item.addEventListener('click', function () {
           const idx = parseInt(this.getAttribute('data-model-idx'));
           if (!isNaN(idx) && modelInstances[idx]) {
             selectModel(modelInstances[idx]);
-            // Focus on the model
             focusOnSelectedModel(modelInstances[idx]);
           }
         });
@@ -2435,16 +2695,35 @@ function updateSelectedModelControls(modelInstance) {
       return;
     }
   }
-  // Model selected
+
   noSelection.style.display = 'none';
   selectedControls.style.display = 'block';
-  
+
+    // Check if model is valid
+    if (!modelInstance.model || !modelInstance.model.position) {
+      console.warn("Invalid model instance provided to updateSelectedModelControls");
+      return;
+    }
+
   const model = modelInstance.model;
-  const modelName = modelInstance.name;
+    const modelName = modelInstance.name || '';
   const baseName = modelName.replace(/ \d+$/, '');
   const allModels = { ...models, ...importedModels };
-  const modelConfig = allModels[baseName] || allModels[modelName];
-  
+    const modelConfig = allModels[baseName] || allModels[modelName] || {};
+
+    // Get position values with fallbacks
+    const posX = model.position && !isNaN(model.position.x) ? model.position.x.toFixed(2) : '0.00';
+    const posZ = model.position && !isNaN(model.position.z) ? model.position.z.toFixed(2) : '0.00';
+    let scale = 1; // Default value
+    if (modelInstance.scale && typeof modelInstance.scale === 'number') {
+      scale = modelInstance.scale;
+    } else if (modelInstance.model && modelInstance.model.scale) {
+      // Get from the model's scale property, usually a Vector3, take the x component as uniform scale
+      scale = modelInstance.model.scale.x || 1;
+    }
+    // Ensure scale is a valid number within a reasonable range
+    scale = Math.max(0.1, Math.min(2, scale));
+
   selectedControls.innerHTML = `
     <div class="selected-model-header">
       <div class="model-preview">
@@ -2454,7 +2733,7 @@ function updateSelectedModelControls(modelInstance) {
         <h4>${modelName}</h4>
       </div>
     </div>
-    
+
     <div class="control-section">
       <h5><i class="fa-solid fa-arrows-alt"></i> Transform</h5>
       <div class="transform-mode-controls">
@@ -2471,21 +2750,21 @@ function updateSelectedModelControls(modelInstance) {
         <div class="control-group">
           <label>Position</label>
           <div class="input-group">
-            <input type="number" id="posX" value="${model.position.x.toFixed(2)}" step="5" placeholder="X">
-            <input type="number" id="posZ" value="${model.position.z.toFixed(2)}" step="5" placeholder="Z">
+              <input type="number" id="posX" value="${posX}" step="5" placeholder="X">
+              <input type="number" id="posZ" value="${posZ}" step="5" placeholder="Z">
           </div>
         </div>
-        
+
         <div class="control-group">
-          <label class="range-label">
-            <span>Scale:</span>
-            <input type="range" id="scaleSlider" min="0.1" max="2" step="0.1" value="${modelInstance.scale || 1}">
-            <span class="range-value">${(modelInstance.scale || 1).toFixed(1)}x</span>
-          </label>
+          <label>Scale</label>
+          <div class="input-group">
+              <input type="range" id="scaleSlider" min="0.1" max="2" step="0.1" value="${scale.toFixed(1)}">
+              <span class="range-value">${scale.toFixed(1)}x</span>
+          </div>
         </div>
       </div>
     </div>
-    
+
     <div class="control-section">
       <h5><i class="fa-solid fa-wrench"></i> Actions</h5>
       <div class="action-buttons">
@@ -2500,26 +2779,116 @@ function updateSelectedModelControls(modelInstance) {
         </button>
       </div>
     </div>
-    
+
     <div class="control-section">
       <h5><i class="fa-solid fa-layer-group"></i> Hierarchy</h5>
       <div class="hierarchy-info">
         <p><strong>Type:</strong> ${modelName}</p>
         <p><strong>Vertices:</strong> <span id="vertexCount">Calculating...</span></p>
         <p><strong>Materials:</strong> <span id="materialCount">Calculating...</span></p>
-        ${modelConfig.isImported && modelConfig.recommendedScale ? `
-          <p><strong>Recommended Scale:</strong> ${modelConfig.recommendedScale.toFixed(2)}x</p>
-        ` : ''}
+          ${modelConfig && modelConfig.isImported && modelConfig.recommendedScale ? `<p><strong>Recommended Scale:</strong> ${modelConfig.recommendedScale.toFixed(2)}x</p>` : ''}
       </div>
     </div>
   `;
+
+    try {
+  modelInstance.initialTransformState = {
+    position: model.position.clone(),
+    scale: model.scale.clone(),
+    rotation: model.rotation.clone()
+  };
+    } catch (error) {
+      console.warn("Error storing initial transform state:", error);
+    }
+
+  const scaleSlider = document.getElementById('scaleSlider');
+  const scaleText = selectedControls.querySelector('.range-value');
+
+    if (scaleSlider && scaleText) {
+  function updateScale(scaleValue, pushUndo = false) {
+        try {
+  const safeValue = isNaN(scaleValue) ? 1 : scaleValue;
+  const clamped = Math.max(0.1, Math.min(2, safeValue));
   
-  // Setup event listeners for the controls
-  setupSelectedModelEventListeners(modelInstance);
+  const applied = applySafeScale(modelInstance.model, clamped, modelConfig); 
   
-  // Update model statistics
-  updateModelStatistics(model);
+  scaleSlider.value = applied.toFixed(1);
+  scaleText.textContent = `${applied.toFixed(1)}x`;
+
+  if (pushUndo) {
+    let oldTransformStateForUndo = null;
+
+    if (modelInstance.initialTransformState && 
+        typeof modelInstance.initialTransformState.scale === 'object' && 
+        'x' in modelInstance.initialTransformState.scale) {
+      oldTransformStateForUndo = {
+        position: modelInstance.initialTransformState.position.clone(),
+        scale: { ...modelInstance.initialTransformState.scale },
+        rotation: modelInstance.initialTransformState.rotation.clone()
+      };
+    } else {
+      const currentModelScaleBeforeUpdate = Math.max(0.1, Math.min(2.0, modelInstance.model.scale.x));
+      oldTransformStateForUndo = {
+        position: modelInstance.model.position.clone(),
+        scale: { x: currentModelScaleBeforeUpdate, y: currentModelScaleBeforeUpdate, z: currentModelScaleBeforeUpdate },
+        rotation: modelInstance.model.rotation.clone()
+      };
+    }
+
+    undoStack.push({
+      type: 'transform',
+      modelId: modelInstance.model.uuid,
+      oldPosition: oldTransformStateForUndo.position,
+      oldScale: oldTransformStateForUndo.scale,
+      oldRotation: oldTransformStateForUndo.rotation,
+      newPosition: modelInstance.model.position.clone(),
+      newScale: { x: applied, y: applied, z: applied },
+      newRotation: modelInstance.model.rotation.clone()
+    });
+    
+    if (undoStack.length > MAX_HISTORY_STATES) undoStack.shift();
+    redoStack.length = 0;
+    
+    modelInstance.initialTransformState = {
+      position: modelInstance.model.position.clone(),
+      scale: { x: applied, y: applied, z: applied },
+      rotation: modelInstance.model.rotation.clone()
+    };
+  }
+
+  markSceneAsChanged();
+  scheduleRender();
+        } catch (error) {
+          console.error("Error updating scale:", error);
+        }
 }
+
+      try {
+  scaleSlider.addEventListener('input', () => updateScale(parseFloat(scaleSlider.value)));
+  scaleSlider.addEventListener('change', () => updateScale(parseFloat(scaleSlider.value)));
+      } catch (error) {
+        console.warn("Error setting up scale slider events:", error);
+      }
+    }
+
+    try {
+  updateModelStatistics(model);
+    } catch (error) {
+      console.warn("Error updating model statistics:", error);
+    }
+
+    try {
+  setupSelectedModelEventListeners(modelInstance);
+    } catch (error) {
+      console.warn("Error setting up model event listeners:", error);
+    }
+  } catch (error) {
+    console.error("Error in updateSelectedModelControls:", error);
+  }
+}
+
+
+
 
 // Setup event listeners for selected model controls
 function setupSelectedModelEventListeners(modelInstance) {
@@ -2529,19 +2898,73 @@ function setupSelectedModelEventListeners(modelInstance) {
   const baseName = modelName.replace(/ \d+$/, ''); // Remove number suffix to get base name
   const modelConfig = allModels[baseName] || allModels[modelName];
   
-  // Position controls
+  // --- START: UNDO/REDO FIX FOR NUMERICAL INPUTS ---
   ['posX', 'posY', 'posZ'].forEach((id, index) => {
     const input = document.getElementById(id);
     if (input) {
+      let lastValue = null;
+      let lastPosition = null;
+      let lastScale = null;
+      let lastRotation = null;
+
+      // Always capture the initial state on focus
+      input.addEventListener('focus', () => {
+        lastValue = parseFloat(input.value);
+        lastPosition = model.position.clone();
+        lastScale = model.scale.clone();
+        lastRotation = model.rotation.clone();
+      });
+
+      // Also capture initial state if input is changed without focus (fallback)
+      input.addEventListener('mousedown', () => {
+        if (lastValue === null) {
+          lastValue = parseFloat(input.value);
+          lastPosition = model.position.clone();
+          lastScale = model.scale.clone();
+          lastRotation = model.rotation.clone();
+        }
+      });
+
       input.addEventListener('input', (e) => {
-        const value = parseFloat(e.target.value) || 0;
+        const value = parseFloat(e.target.value);
+        if (isNaN(value)) return; // Don't update if input is not a valid number
+
         const axis = ['x', 'y', 'z'][index];
+        // Only push undo if the value actually changes
+        if (lastValue !== null && value !== lastValue) {
+          undoStack.push({
+            type: 'transform',
+            modelId: model.uuid,
+            oldPosition: lastPosition.clone(),
+            oldScale: lastScale.clone(),
+            oldRotation: lastRotation.clone(),
+            newPosition: model.position.clone(),
+            newScale: model.scale.clone(),
+            newRotation: model.rotation.clone()
+          });
+          if (undoStack.length > MAX_HISTORY_STATES) {
+            undoStack.shift();
+          }
+          redoStack.length = 0;
+          lastValue = value;
+          lastPosition = model.position.clone();
+          lastScale = model.scale.clone();
+          lastRotation = model.rotation.clone();
+        }
         model.position[axis] = value;
-        markSceneAsChanged(); // Mark scene as changed on manual input
+        markSceneAsChanged();
         scheduleRender();
+      });
+
+      input.addEventListener('blur', () => {
+        lastValue = null;
+        lastPosition = null;
+        lastScale = null;
+        lastRotation = null;
       });
     }
   });
+  // --- END: UNDO/REDO FIX FOR NUMERICAL INPUTS ---
   
   // --- START: UNDO/REDO FIX FOR SCALE SLIDER ---
   const scaleSlider = document.getElementById('scaleSlider');
@@ -2616,6 +3039,7 @@ function setupSelectedModelEventListeners(modelInstance) {
             }
             redoStack.length = 0; // A new action clears the redo stack
             console.log("Scale action recorded. Stack size:", undoStack.length);
+            markSceneAsChanged(); // Mark scene as changed when recording undo action
         }
 
         initialSliderState = null; // Reset for the next interaction
@@ -2779,6 +3203,7 @@ function duplicateSelectedModel(modelInstance) {
     control.attach(newModel);
     control.setSize(0.8);
     control.addEventListener('dragging-changed', (event) => {
+      if (isPerformingHistory) return;
       orbit.enabled = !event.value;
       if (event.value === false && control.object) { // Dragging ended
         const currentTransformState = {
@@ -2901,14 +3326,25 @@ function deleteSelectedModel(modelInstance) {
     modal.remove();
     
     // Record 'delete' action for undo before removing
+    // Get the model configuration
+    const baseName = modelInstance.name ? modelInstance.name.replace(/ \d+$/, '') : '';
+    const allModels = { ...models, ...importedModels };
+    const modelConfig = modelInstance.modelConfig || allModels[baseName] || allModels[modelInstance.name] || {};
+    
+    // Get the URL from the model config or try to find it
+    const modelUrl = modelInstance.modelUrl || 
+                    (modelConfig ? modelConfig.url : null) || 
+                    './static/models/silo.glb'; // Fallback URL
+    
     undoStack.push({ 
       type: 'delete', 
       modelId: modelInstance.model.uuid, 
-      modelConfig: modelInstance.modelConfig, // Store config to re-load if needed
+      modelConfig: modelConfig, // Store config to re-load if needed
       position: modelInstance.model.position.clone(),
       rotation: modelInstance.model.rotation.clone(),
       scale: modelInstance.model.scale.clone(),
-      name: modelInstance.name
+      name: modelInstance.name,
+      modelUrl: modelUrl // Store URL for future redo operations
     });
     if (undoStack.length > MAX_HISTORY_STATES) {
         undoStack.shift();
@@ -2940,6 +3376,7 @@ function deleteSelectedModel(modelInstance) {
     showNotification('Model removed from scene! You can drag it back from the library.', 'success');
   };
 }
+
 
 // Transform mode control functions
 function setTransformMode() {
@@ -3169,298 +3606,332 @@ function deleteFromLibrary(modelName) {
  * Undoes the last action recorded in the undoStack.
  * Supports 'add', 'delete', and 'transform' actions.
  */
-function undo() {
-    if (undoStack.length === 0) {
-        console.log("Nothing to undo.");
-        showNotification("Nothing to undo!", "info");
-        return;
-    }
 
-    const action = undoStack.pop(); // Get the last action
-    redoStack.push(action); // Push to redo stack
-
-    console.log("Undoing action:", action.type, action);
-
-    if (action.type === 'add' && !action.preventRemoveOnUndo) {
-        // Find the model instance by UUID
-        const modelInstance = modelInstances.find(inst => inst.model.uuid === action.modelId);
-        if (modelInstance) {
-            scene.remove(modelInstance.model);
-            scene.remove(modelInstance.control);
-            // Remove from instances array
-            modelInstances.splice(modelInstances.indexOf(modelInstance), 1);
-            // Remove from controls list
-            controlsList.splice(controlsList.indexOf(modelInstance.control), 1);
-            
-            // --- FIX STARTS HERE ---
-            if (selectedModel === modelInstance) {
-                deselectAllModels(); // Deselect if the undone model was selected, this also updates the UI.
-            } else {
-                // If another model (or no model) was selected, we still need to refresh the sidebar
-                // to show the updated list of models in the scene.
-                updateSelectedModelControls(selectedModel);
-            }
-            // --- FIX ENDS HERE ---
-
-            showNotification(`Undid: Added "${modelInstance.name}"`, "success");
-        } else {
-            console.warn("Model not found for 'add' undo:", action.modelId);
-            showNotification("Error undoing 'add' action.", "error");
+// Function to safely update position input fields
+function updatePositionInputFields(model) {
+    try {
+        // Get references to the input fields
+        const posXInput = document.getElementById('posX');
+        const posYInput = document.getElementById('posY');
+        const posZInput = document.getElementById('posZ');
+        
+        // Check if the input fields exist
+        if (!posXInput || !posYInput || !posZInput) {
+            console.log("Position input fields not found in the DOM");
+            return;
         }
-    } else if (action.type === 'delete') {
-        // Re-add the model to the scene
-        const loader = new GLTFLoader();
-        loader.load(action.modelConfig.url, (gltf) => {
-            const model = gltf.scene;
-            model.position.copy(action.position);
-            model.rotation.copy(action.rotation);
-            model.scale.copy(action.scale);
-            model.name = action.name; // Restore original name
+        
+    if (model) {
+            // Make sure position values exist and are valid numbers
+            const x = model.position && !isNaN(model.position.x) ? model.position.x.toFixed(2) : '0.00';
+            const y = model.position && !isNaN(model.position.y) ? model.position.y.toFixed(2) : '0.00';
+            const z = model.position && !isNaN(model.position.z) ? model.position.z.toFixed(2) : '0.00';
 
-            model.traverse(child => {
-                if (child.isMesh) {
-                    child.castShadow = true;
-                    child.receiveShadow = true;
-                }
-            });
-            scene.add(model);
-
-            const control = new TransformControls(currentCamera, renderer.domElement);
-            control.setSpace("world");
-            control.attach(model);
-            control.setSize(0.8);
-            control.visible = false;
-            control.enabled = false;
-
-            // Re-attach dragging-changed listener for re-added model
-            control.addEventListener('dragging-changed', (event) => {
-                orbit.enabled = !event.value;
-                if (event.value === false && control.object) { // Dragging ended
-                    const currentTransformState = {
-                        position: control.object.position.clone(),
-                        scale: control.object.scale.clone(),
-                        rotation: control.object.rotation.clone()
-                    };
-                    const instance = modelInstances.find(inst => inst.model === control.object);
-                    if (instance && instance.initialTransformState) {
-                        if (!instance.initialTransformState.position.equals(currentTransformState.position) ||
-                            !instance.initialTransformState.scale.equals(currentTransformState.scale) ||
-                            !instance.initialTransformState.rotation.equals(currentTransformState.rotation)) {
-                            undoStack.push({
-                                type: 'transform',
-                                modelId: control.object.uuid,
-                                oldPosition: instance.initialTransformState.position,
-                                oldScale: instance.initialTransformState.scale,
-                                oldRotation: instance.initialTransformState.rotation,
-                                newPosition: currentTransformState.position,
-                                newScale: currentTransformState.scale,
-                                newRotation: currentTransformState.rotation,
-                                preventRemoveOnUndo: true
-                            });
-                            if (undoStack.length > MAX_HISTORY_STATES) { undoStack.shift(); }
-                            redoStack.length = 0;
-                        }
-                        instance.initialTransformState = null;
-                    }
-                } else if (event.value === true && control.object) {
-                    const instance = modelInstances.find(inst => inst.model === control.object);
-                    if (instance) {
-                        instance.initialTransformState = {
-                            position: control.object.position.clone(),
-                            scale: control.object.scale.clone(),
-                            rotation: control.object.rotation.clone()
-                        };
-                    }
-                }
-            });
-            control.addEventListener('change', () => {
-                markSceneAsChanged();
-                scheduleRender();
-            });
-
-            scene.add(control);
-            controlsList.push(control);
-
-            const newModelInstance = {
-                model: model,
-                control: control,
-                name: action.name,
-                scale: action.scale.x // Assuming uniform scale
-            };
-            modelInstances.push(newModelInstance);
-            updateSceneStats();
-            selectModel(newModelInstance); // Select the re-added model
-            showNotification(`Undid: Deleted "${action.name}"`, "success");
-            scheduleRender();
-        }, undefined, (error) => {
-            console.error('Error re-loading model for undo:', error);
-            showNotification("Error re-adding model on undo.", "error");
-        });
-
-    } else if (action.type === 'transform') {
-        const model = scene.getObjectByProperty('uuid', action.modelId);
-        if (model) {
-            // Revert to the old state (before the transformation)
-            model.position.copy(action.oldPosition);
-            model.scale.copy(action.oldScale);
-            model.rotation.copy(action.oldRotation);
-            showNotification(`Undid: Transform on "${model.name || model.uuid}"`, "success");
-        } else {
-            console.warn("Model not found for 'transform' undo:", action.modelId);
-            showNotification("Error undoing 'transform' action.", "error");
+            // Update the input fields
+            posXInput.value = x;
+            posYInput.value = y;
+            posZInput.value = z;
+    } else {
+        // Clear inputs if no model is selected
+            posXInput.value = '';
+            posYInput.value = '';
+            posZInput.value = '';
         }
+    } catch (error) {
+        console.log("Error updating position input fields:", error);
+        // Don't throw the error further - just log it
     }
-    updateSceneStats();
-    scheduleRender();
-    render();
 }
+// Make it globally available if needed, similar to other functions in drag.js
+window.updatePositionInputFields = updatePositionInputFields;
+
+function undo() {
+  if (undoStack.length === 0) {
+    showNotification("Nothing to undo.", "info");
+    return;
+  }
+  isPerformingHistory = true;
+  const action = undoStack.pop();
+  if (!action) {
+    isPerformingHistory = false;
+    return;
+  }
+  redoStack.push(action);
+  if (action.type === 'add') {
+    const inst = modelInstances.find(i => i.model.uuid === action.modelId);
+    if (inst) {
+      scene.remove(inst.model);
+      scene.remove(inst.control);
+      modelInstances.splice(modelInstances.indexOf(inst), 1);
+      controlsList.splice(controlsList.indexOf(inst.control), 1);
+    }
+    deselectAllModels();
+    updateSelectedModelControls(null);
+  } else if (action.type === 'delete') {
+    const loader = new GLTFLoader();
+    loader.load(action.modelUrl, gltf => {
+      const model = gltf.scene;
+      model.uuid = action.modelId;
+      model.position.copy(action.position);
+      model.rotation.copy(action.rotation);
+      model.scale.copy(action.scale);
+      model.traverse(c => { if (c.isMesh) { c.castShadow = c.receiveShadow = true; } });
+      scene.add(model);
+      const control = new TransformControls(currentCamera, renderer.domElement);
+      control.attach(model);
+      control.setSize(0.8);
+      control.visible = control.enabled = false;
+      control.addEventListener('dragging-changed', event => {
+        if (isPerformingHistory) return;
+        orbit.enabled = !event.value;
+        if (event.value === false && control.object) {
+          const s = control.object;
+          const cs = { position: s.position.clone(), scale: s.scale.clone(), rotation: s.rotation.clone() };
+          const inst = modelInstances.find(i => i.model === s);
+          if (inst && inst.initialTransformState) {
+            const o = inst.initialTransformState;
+            if (!o.position.equals(cs.position) || !o.scale.equals(cs.scale) || !o.rotation.equals(cs.rotation)) {
+              undoStack.push({
+                type: 'transform',
+                modelId: s.uuid,
+                oldPosition: o.position,
+                oldScale: o.scale,
+                oldRotation: o.rotation,
+                newPosition: cs.position,
+                newScale: cs.scale,
+                newRotation: cs.rotation
+              });
+              if (undoStack.length > MAX_HISTORY_STATES) undoStack.shift();
+              redoStack.length = 0;
+            }
+            inst.initialTransformState = null;
+          }
+        } else if (event.value === true && control.object) {
+          const inst = modelInstances.find(i => i.model === control.object);
+          if (inst) {
+            inst.initialTransformState = {
+              position: control.object.position.clone(),
+              scale: control.object.scale.clone(),
+              rotation: control.object.rotation.clone()
+            };
+          }
+        }
+      });
+      control.addEventListener('change', () => {
+        markSceneAsChanged();
+        scheduleRender();
+      });
+      scene.add(control);
+      controlsList.push(control);
+      const newInst = { model, control, name: action.name, scale: action.scale.x, modelConfig: action.modelConfig, modelUrl: action.modelUrl };
+      modelInstances.push(newInst);
+      updateSceneStats();
+      selectModel(newInst);
+      setTimeout(() => {
+        if (selectedModel === newInst) updateSelectedModelControls(newInst);
+      }, 100);
+      scheduleRender();
+    }, undefined, () => {
+      showNotification('Error restoring deleted model', 'error');
+    });
+  } else if (action.type === 'transform') {
+    const inst = modelInstances.find(i => i.model.uuid === action.modelId);
+    if (inst) {
+      inst.model.position.copy(action.oldPosition);
+      inst.model.rotation.copy(action.oldRotation);
+      inst.model.scale.copy(action.oldScale);
+      if (selectedModel === inst) {
+        updateSelectedModelControls(inst);
+        updatePositionInputFields(inst.model);
+      }
+    }
+  }
+  markSceneAsChanged();
+  updateSceneStats();
+  if (selectedModel) updateSelectedModelControls(selectedModel);
+  else updateSelectedModelControls(null);
+  scheduleRender();
+  isPerformingHistory = false;
+}
+
+
 
 /**
  * Re-applies the last action undone.
- * Currently primarily supports redoing 'transform' actions.
+ * Mirror of the undo function but applies actions in reverse.
  */
-function redo() {
-    if (redoStack.length === 0) {
-        console.log("Nothing to redo.");
-        showNotification("Nothing to redo!", "info");
-        return;
-    }
-
-    const action = redoStack.pop();
-    undoStack.push(action); // Push back to undo stack
-
-    console.log("Redoing action:", action.type, action);
-
-    if (action.type === 'add') {
-        // Re-add the model to the scene
-        const loader = new GLTFLoader();
-        loader.load(action.modelConfig.url, (gltf) => {
-            const model = gltf.scene;
-            model.position.copy(action.initialPosition);
-            model.rotation.copy(action.initialRotation);
-            model.scale.copy(action.initialScale);
-            model.name = action.name; // Restore original name
-
-            model.traverse(child => {
-                if (child.isMesh) {
-                    child.castShadow = true;
-                    child.receiveShadow = true;
-                }
-            });
-            scene.add(model);
-
-            const control = new TransformControls(currentCamera, renderer.domElement);
-            control.setSpace("world");
-            control.attach(model);
-            control.setSize(0.8);
-            control.visible = false;
-            control.enabled = false;
-
-            // Re-attach dragging-changed listener for re-added model
-            control.addEventListener('dragging-changed', (event) => {
-                orbit.enabled = !event.value;
-                if (event.value === false && control.object) { // Dragging ended
-                    const currentTransformState = {
-                        position: control.object.position.clone(),
-                        scale: control.object.scale.clone(),
-                        rotation: control.object.rotation.clone()
-                    };
-                    const instance = modelInstances.find(inst => inst.model === control.object);
-                    if (instance && instance.initialTransformState) {
-                        if (!instance.initialTransformState.position.equals(currentTransformState.position) ||
-                            !instance.initialTransformState.scale.equals(currentTransformState.scale) ||
-                            !instance.initialTransformState.rotation.equals(currentTransformState.rotation)) {
-                            undoStack.push({
-                                type: 'transform',
-                                modelId: control.object.uuid,
-                                oldPosition: instance.initialTransformState.position,
-                                oldScale: instance.initialTransformState.scale,
-                                oldRotation: instance.initialTransformState.rotation,
-                                newPosition: currentTransformState.position,
-                                newScale: currentTransformState.scale,
-                                newRotation: currentTransformState.rotation
-                            });
-                            if (undoStack.length > MAX_HISTORY_STATES) { undoStack.shift(); }
-                            redoStack.length = 0;
-                        }
-                        instance.initialTransformState = null;
-                    }
-                } else if (event.value === true && control.object) {
-                    const instance = modelInstances.find(inst => inst.model === control.object);
-                    if (instance) {
-                        instance.initialTransformState = {
-                            position: control.object.position.clone(),
-                            scale: control.object.scale.clone(),
-                            rotation: control.object.rotation.clone()
-                        };
-                    }
-                }
-            });
-            control.addEventListener('change', () => {
-                markSceneAsChanged();
-                scheduleRender();
-            });
-
-            scene.add(control);
-            controlsList.push(control);
-
-            const newModelInstance = {
-                model: model,
-                control: control,
-                name: action.name,
-                scale: action.initialScale.x // Assuming uniform scale
-            };
-            modelInstances.push(newModelInstance);
-            updateSceneStats();
-            selectModel(newModelInstance); // Select the re-added model
-            showNotification(`Redid: Added "${action.name}"`, "success");
-            scheduleRender();
-        }, undefined, (error) => {
-            console.error('Error re-loading model for redo:', error);
-            showNotification("Error re-adding model on redo.", "error");
+// Debug function to print the redo stack
+function debugRedoStack() {
+    console.log("===== REDO STACK DEBUG =====");
+    console.log(`Redo stack length: ${window.redoStack.length}`);
+    
+    window.redoStack.forEach((action, index) => {
+        console.log(`[${index}] Type: ${action.type}, ModelID: ${action.modelId}`);
+        if (action.type === 'transform') {
+            console.log(`    Position: ${action.newPosition ? JSON.stringify(action.newPosition) : 'undefined'}`);
+        }
+    });
+    
+    console.log("===== UNDO STACK DEBUG =====");
+    console.log(`Undo stack length: ${window.undoStack.length}`);
+    
+    window.undoStack.forEach((action, index) => {
+        console.log(`[${index}] Type: ${action.type}, ModelID: ${action.modelId}`);
+    });
+    
+    console.log("=== MODEL INSTANCES ===");
+    modelInstances.forEach((instance, index) => {
+        console.log(`[${index}] Name: ${instance.name}, UUID: ${instance.model.uuid}`);
+    });
+    
+    console.log("=== ID MAPPINGS ===");
+    if (window.modelIdMapping) {
+        Object.keys(window.modelIdMapping).forEach(oldId => {
+            console.log(`${oldId} -> ${window.modelIdMapping[oldId]}`);
         });
-    } else if (action.type === 'delete') {
-        // Remove the model from the scene (reverse of undoing 'delete')
-        const modelInstance = modelInstances.find(inst => inst.model.uuid === action.modelId);
-        if (modelInstance) {
-            scene.remove(modelInstance.model);
-            scene.remove(modelInstance.control);
-            modelInstances.splice(modelInstances.indexOf(modelInstance), 1);
-            controlsList.splice(controlsList.indexOf(modelInstance.control), 1);
-            
-            // --- FIX STARTS HERE ---
-            if (selectedModel === modelInstance) {
-                deselectAllModels();
-            } else {
-                // Refresh the sidebar to reflect the removal of the model from the list.
-                updateSelectedModelControls(selectedModel);
-            }
-            // --- FIX ENDS HERE ---
-
-            showNotification(`Redid: Deleted "${modelInstance.name}"`, "success");
-        } else {
-            console.warn("Model not found for 'delete' redo:", action.modelId);
-            showNotification("Error redoing 'delete' action.", "error");
-        }
-    } else if (action.type === 'transform') {
-        const model = scene.getObjectByProperty('uuid', action.modelId);
-        if (model) {
-            // Re-apply the new state (after the transformation)
-            model.position.copy(action.newPosition);
-            model.scale.copy(action.newScale);
-            model.rotation.copy(action.newRotation);
-            showNotification(`Redid: Transform on "${model.name || model.uuid}"`, "success");
-        } else {
-            console.warn("Model not found for 'transform' redo:", action.modelId);
-            showNotification("Error redoing 'transform' action.", "error");
-        }
+    } else {
+        console.log("No ID mappings found");
     }
-    updateSceneStats();
-    scheduleRender();
+    
+    console.log("===========================");
 }
+
+function redo() {
+  if (redoStack.length === 0) {
+    showNotification("Nothing to redo.", "info");
+    return;
+  }
+  isPerformingHistory = true;
+  const action = redoStack.pop();
+  if (!action) {
+    isPerformingHistory = false;
+    return;
+  }
+  undoStack.push(action);
+  if (action.type === 'add') {
+    const loader = new GLTFLoader();
+    loader.load(action.modelUrl, gltf => {
+      const model = gltf.scene;
+      model.uuid = action.modelId;
+      model.position.copy(action.position);
+      model.rotation.copy(action.rotation);
+      model.scale.copy(action.scale);
+      model.traverse(c => { if (c.isMesh) { c.castShadow = c.receiveShadow = true; } });
+      scene.add(model);
+      const control = new TransformControls(currentCamera, renderer.domElement);
+      control.attach(model);
+      control.setSize(0.8);
+      control.visible = control.enabled = false;
+      control.addEventListener('dragging-changed', event => {
+        if (isPerformingHistory) return;
+        orbit.enabled = !event.value;
+        if (event.value === false && control.object) {
+          const s = control.object;
+          const cs = { position: s.position.clone(), scale: s.scale.clone(), rotation: s.rotation.clone() };
+          const inst = modelInstances.find(i => i.model === s);
+          if (inst && inst.initialTransformState) {
+            const o = inst.initialTransformState;
+            if (!o.position.equals(cs.position) || !o.scale.equals(cs.scale) || !o.rotation.equals(cs.rotation)) {
+              undoStack.push({
+                type: 'transform',
+                modelId: s.uuid,
+                oldPosition: o.position,
+                oldScale: o.scale,
+                oldRotation: o.rotation,
+                newPosition: cs.position,
+                newScale: cs.scale,
+                newRotation: cs.rotation
+              });
+              if (undoStack.length > MAX_HISTORY_STATES) undoStack.shift();
+              redoStack.length = 0;
+            }
+            inst.initialTransformState = null;
+          }
+        } else if (event.value === true && control.object) {
+          const inst = modelInstances.find(i => i.model === control.object);
+          if (inst) {
+            inst.initialTransformState = {
+              position: control.object.position.clone(),
+              scale: control.object.scale.clone(),
+              rotation: control.object.rotation.clone()
+            };
+          }
+        }
+      });
+      control.addEventListener('change', () => {
+        markSceneAsChanged();
+        scheduleRender();
+      });
+      scene.add(control);
+      controlsList.push(control);
+      const newInst = { model, control, name: action.name, scale: action.scale.x, modelConfig: action.modelConfig, modelUrl: action.modelUrl };
+      modelInstances.push(newInst);
+      updateSceneStats();
+      selectModel(newInst);
+      setTimeout(() => {
+        if (selectedModel === newInst) updateSelectedModelControls(newInst);
+      }, 100);
+      scheduleRender();
+    }, undefined, () => {
+      showNotification('Error re-adding model', 'error');
+    });
+  } else if (action.type === 'delete') {
+    const inst = modelInstances.find(i => i.model.uuid === action.modelId);
+    if (inst) {
+      scene.remove(inst.model);
+      scene.remove(inst.control);
+      modelInstances.splice(modelInstances.indexOf(inst), 1);
+      controlsList.splice(controlsList.indexOf(inst.control), 1);
+    }
+    deselectAllModels();
+    updateSelectedModelControls(null);
+  } else if (action.type === 'transform') {
+    const inst = modelInstances.find(i => i.model.uuid === action.modelId);
+    if (inst) {
+      inst.model.position.copy(action.newPosition);
+      inst.model.rotation.copy(action.newRotation);
+      inst.model.scale.copy(action.newScale);
+      if (selectedModel === inst) {
+        updateSelectedModelControls(inst);
+        updatePositionInputFields(inst.model);
+      }
+    }
+  }
+  markSceneAsChanged();
+  updateSceneStats();
+  if (selectedModel) updateSelectedModelControls(selectedModel);
+  else updateSelectedModelControls(null);
+  scheduleRender();
+  isPerformingHistory = false;
+}
+
 
 window.deleteFromLibrary = deleteFromLibrary;
 window.addEventListener('beforeunload', (e) => {
+  // Always try to save to localStorage before unloading, regardless of hasUnsavedChanges
+  try {
+    saveSceneToCache();
+    
+    // Also save a special "last session" cache that can be recovered
+    const lastSessionData = {
+      timestamp: Date.now(),
+      modelInstances: modelInstances.map(instance => ({
+        name: instance.name,
+        position: instance.model.position.toArray(),
+        scale: instance.model.scale.toArray(),
+        rotation: instance.model.rotation.toArray(),
+        uuid: instance.model.uuid,
+        modelUrl: instance.modelUrl || instance.modelConfig?.url
+      }))
+    };
+    
+    localStorage.setItem('lastSessionCache', JSON.stringify(lastSessionData));
+    console.log('[Session] Saved last session data');
+  } catch (error) {
+    console.error('Failed to save scene before unloading:', error);
+  }
+  
+  // Only show warning dialog if there are unsaved changes
   if (hasUnsavedChanges) {
     e.preventDefault();
     e.returnValue = '';
@@ -3513,3 +3984,39 @@ window.markSceneAsChanged = markSceneAsChanged;
 window.markSceneAsSaved = markSceneAsSaved;
 window.hasUnsavedChanges = () => hasUnsavedChanges;
 window.showSaveConfirmationDialog = showSaveConfirmationDialog;
+
+// Function to load a model from the library
+function loadModelFromLibrary(modelName) {
+  const modelConfig = models[modelName] || importedModels[modelName];
+  
+  if (!modelConfig) {
+    console.error(`Model configuration not found for: ${modelName}`);
+    showNotification(`Error: Model configuration not found for ${modelName}`, 'error');
+    return;
+  }
+  
+  const loader = new GLTFLoader();
+  
+  // Add a try-catch block around the loader
+  try {
+    loader.load(modelConfig.url, (gltf) => {
+      // Model loaded successfully, process it
+      const model = gltf.scene;
+      
+      // Rest of your model loading code...
+      
+    }, 
+    // Progress callback
+    (xhr) => {
+      console.log(`${modelName} loading: ${(xhr.loaded / xhr.total * 100).toFixed(0)}%`);
+    }, 
+    // Error callback
+    (error) => {
+      console.error(`Error loading model ${modelName}:`, error);
+      showNotification(`Error loading model: ${modelName}. Please check if the model file is valid.`, 'error');
+    });
+  } catch (err) {
+    console.error(`Exception while loading model ${modelName}:`, err);
+    showNotification(`Failed to load model: ${modelName}. The model file might be corrupted.`, 'error');
+  }
+}
