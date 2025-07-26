@@ -2714,13 +2714,27 @@ function updateSelectedModelControls(modelInstance) {
     // Get position values with fallbacks
     const posX = model.position && !isNaN(model.position.x) ? model.position.x.toFixed(2) : '0.00';
     const posZ = model.position && !isNaN(model.position.z) ? model.position.z.toFixed(2) : '0.00';
+
+    // Get the current scale from the model - this ensures UI reflects actual model state
     let scale = 1; // Default value
-    if (modelInstance.scale && typeof modelInstance.scale === 'number') {
-      scale = modelInstance.scale;
-    } else if (modelInstance.model && modelInstance.model.scale) {
-      // Get from the model's scale property, usually a Vector3, take the x component as uniform scale
+    if (modelInstance.model && modelInstance.model.scale) {
+      // Always get the current scale from the model's scale property (Vector3)
+      // Use the x component as uniform scale since we apply uniform scaling
       scale = modelInstance.model.scale.x || 1;
+    } else if (modelInstance.scale && typeof modelInstance.scale === 'number') {
+      // Fallback to stored scale value
+      scale = modelInstance.scale;
     }
+
+    // Convert from real-world scale back to UI scale if needed
+    // For models with real dimensions, we need to calculate the UI scale factor
+    if (modelConfig && modelConfig.realDimensions && modelConfig.glbDimensions) {
+      // Calculate the base scale factor used for real-world scaling
+      const baseScaleX = modelConfig.realDimensions.width / modelConfig.glbDimensions.width;
+      // The UI scale is the current scale divided by the base scale
+      scale = scale / baseScaleX;
+    }
+
     // Ensure scale is a valid number within a reasonable range
     scale = Math.max(0.1, Math.min(2, scale));
 
@@ -2801,8 +2815,8 @@ function updateSelectedModelControls(modelInstance) {
       console.warn("Error storing initial transform state:", error);
     }
 
-  const scaleSlider = document.getElementById('scaleSlider');
-  const scaleText = selectedControls.querySelector('.range-value');
+    const scaleSlider = document.getElementById('scaleSlider');
+    const scaleText = selectedControls.querySelector('.range-value');
 
     if (scaleSlider && scaleText) {
   function updateScale(scaleValue, pushUndo = false) {
@@ -2818,19 +2832,23 @@ function updateSelectedModelControls(modelInstance) {
   if (pushUndo) {
     let oldTransformStateForUndo = null;
 
-    if (modelInstance.initialTransformState && 
-        typeof modelInstance.initialTransformState.scale === 'object' && 
+    if (modelInstance.initialTransformState &&
+        typeof modelInstance.initialTransformState.scale === 'object' &&
         'x' in modelInstance.initialTransformState.scale) {
       oldTransformStateForUndo = {
         position: modelInstance.initialTransformState.position.clone(),
-        scale: { ...modelInstance.initialTransformState.scale },
+        scale: modelInstance.initialTransformState.scale.clone ?
+               modelInstance.initialTransformState.scale.clone() :
+               new THREE.Vector3(modelInstance.initialTransformState.scale.x,
+                               modelInstance.initialTransformState.scale.y,
+                               modelInstance.initialTransformState.scale.z),
         rotation: modelInstance.initialTransformState.rotation.clone()
       };
     } else {
       const currentModelScaleBeforeUpdate = Math.max(0.1, Math.min(2.0, modelInstance.model.scale.x));
       oldTransformStateForUndo = {
         position: modelInstance.model.position.clone(),
-        scale: { x: currentModelScaleBeforeUpdate, y: currentModelScaleBeforeUpdate, z: currentModelScaleBeforeUpdate },
+        scale: new THREE.Vector3(currentModelScaleBeforeUpdate, currentModelScaleBeforeUpdate, currentModelScaleBeforeUpdate),
         rotation: modelInstance.model.rotation.clone()
       };
     }
@@ -2842,7 +2860,7 @@ function updateSelectedModelControls(modelInstance) {
       oldScale: oldTransformStateForUndo.scale,
       oldRotation: oldTransformStateForUndo.rotation,
       newPosition: modelInstance.model.position.clone(),
-      newScale: { x: applied, y: applied, z: applied },
+      newScale: new THREE.Vector3(applied, applied, applied),
       newRotation: modelInstance.model.rotation.clone()
     });
     
@@ -2851,7 +2869,7 @@ function updateSelectedModelControls(modelInstance) {
     
     modelInstance.initialTransformState = {
       position: modelInstance.model.position.clone(),
-      scale: { x: applied, y: applied, z: applied },
+      scale: new THREE.Vector3(applied, applied, applied),
       rotation: modelInstance.model.rotation.clone()
     };
   }
@@ -3740,6 +3758,13 @@ function undo() {
       inst.model.position.copy(action.oldPosition);
       inst.model.rotation.copy(action.oldRotation);
       inst.model.scale.copy(action.oldScale);
+
+      // Update the stored scale value in the instance to match the model
+      if (inst.model.scale && inst.model.scale.x) {
+        inst.scale = inst.model.scale.x;
+      }
+
+      // Force update the UI if this model is currently selected
       if (selectedModel === inst) {
         updateSelectedModelControls(inst);
         updatePositionInputFields(inst.model);
@@ -3813,9 +3838,9 @@ function redo() {
     loader.load(action.modelUrl, gltf => {
       const model = gltf.scene;
       model.uuid = action.modelId;
-      model.position.copy(action.position);
-      model.rotation.copy(action.rotation);
-      model.scale.copy(action.scale);
+      model.position.copy(action.initialPosition);
+      model.rotation.copy(action.initialRotation);
+      model.scale.copy(action.initialScale);
       model.traverse(c => { if (c.isMesh) { c.castShadow = c.receiveShadow = true; } });
       scene.add(model);
       const control = new TransformControls(currentCamera, renderer.domElement);
@@ -3864,7 +3889,7 @@ function redo() {
       });
       scene.add(control);
       controlsList.push(control);
-      const newInst = { model, control, name: action.name, scale: action.scale.x, modelConfig: action.modelConfig, modelUrl: action.modelUrl };
+      const newInst = { model, control, name: action.name, scale: action.initialScale.x, modelConfig: action.modelConfig, modelUrl: action.modelUrl };
       modelInstances.push(newInst);
       updateSceneStats();
       selectModel(newInst);
@@ -3876,21 +3901,31 @@ function redo() {
       showNotification('Error re-adding model', 'error');
     });
   } else if (action.type === 'delete') {
+    // When redoing a delete action, we need to remove the model that was restored during undo
     const inst = modelInstances.find(i => i.model.uuid === action.modelId);
     if (inst) {
       scene.remove(inst.model);
       scene.remove(inst.control);
       modelInstances.splice(modelInstances.indexOf(inst), 1);
       controlsList.splice(controlsList.indexOf(inst.control), 1);
+      deselectAllModels();
+      updateSelectedModelControls(null);
+    } else {
+      console.warn('Model to delete not found during redo operation');
     }
-    deselectAllModels();
-    updateSelectedModelControls(null);
   } else if (action.type === 'transform') {
     const inst = modelInstances.find(i => i.model.uuid === action.modelId);
     if (inst) {
       inst.model.position.copy(action.newPosition);
       inst.model.rotation.copy(action.newRotation);
       inst.model.scale.copy(action.newScale);
+
+      // Update the stored scale value in the instance to match the model
+      if (inst.model.scale && inst.model.scale.x) {
+        inst.scale = inst.model.scale.x;
+      }
+
+      // Force update the UI if this model is currently selected
       if (selectedModel === inst) {
         updateSelectedModelControls(inst);
         updatePositionInputFields(inst.model);
